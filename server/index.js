@@ -18,18 +18,24 @@ app.use(session({
     secret: process.env.SESSION_SECRET || 'default_secret',
     resave: false,
     saveUninitialized: false,
-    cookie: { secure: false } // Set to true if using HTTPS
+    cookie: {
+        httpOnly: true,       // JS cannot read the cookie — security best practice
+        secure:   false,      // set true when you deploy with HTTPS
+        maxAge:   1000 * 60 * 60 * 8,
+    } // Set to true if using HTTPS
 }));
 const db = require('./models');
 
 //Routers
 const customerRouter = require('./routes/Customer');
 const paymentRouter = require('./routes/Payment');
+const adminAuthRouter = require('./routes/adminAuth');
 app.use("/api/customers", customerRouter);
 app.use("/api/payments", paymentRouter);
+app.use('/api/admin', adminAuthRouter);
 
 
-db.sequelize.sync().then(() => {
+db.sequelize.sync({ alter: true }).then(() => {
     app.listen(3001,() =>{
 
         console.log('Server is running on port 3001');
