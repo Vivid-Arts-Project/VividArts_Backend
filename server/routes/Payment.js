@@ -2,13 +2,8 @@ const express = require('express');
 const crypto = require('crypto');
 const router = express.Router();
 const { Payment } = require('../models');
-
-// Prices configuration
-const PRICES = {
-  base: 3800,
-  frame: 800,
-  people: 500
-};
+const { ensureInvoiceGenerated } = require('../utils/invoice');
+const { SIZES, FRAMES, EXTRA_PERSON_PRICE, calculateOrder } = require('../utils/pricing');
 
 // Currency rates
 const CURRENCIES = {
@@ -73,34 +68,28 @@ const mapPayhereStatus = (statusCode) => {
   return 'pending';
 };
 
-// Calculate total and due amount
-const calculateAmounts = () => {
-  const total = PRICES.base + PRICES.frame + PRICES.people;
-  const dueAmount = Math.round(total * 0.5);
-  return { total, dueAmount };
-};
-
 // ============= ROUTES =============
 
 // 1. Create Payment Order
 router.post('/create-order', async (req, res) => {
   try {
-    const { currency, paymentMethod, bankDetails } = req.body;
-    const { dueAmount } = calculateAmounts();
+    const { currency, paymentMethod, bankDetails, order } = req.body;
+    const computedOrder = calculateOrder(order);
 
     const orderData = {
       orderId: createOrderId(),
-      amount: dueAmount,
+      amount: computedOrder.dueAmount,
       currency: currency || 'LKR',
       paymentMethod: paymentMethod || 'card',
       status: 'pending',
+      metadata: { order: computedOrder },
       ...(paymentMethod === 'bank' && bankDetails ? {
         bankName: bankDetails.bankName || null
       } : {})
     };
 
     const payment = await Payment.create(orderData);
-    
+
     res.status(201).json({
       success: true,
       payment: {
@@ -131,7 +120,7 @@ router.post('/create-payhere-checkout', async (req, res) => {
       });
     }
 
-    const { currency = 'LKR', customer = {} } = req.body;
+    const { currency = 'LKR', customer = {}, order } = req.body;
     const selectedCurrency = CURRENCIES[currency] ? currency : 'LKR';
     if (!PAYHERE_ALLOWED_CURRENCIES.includes(selectedCurrency)) {
       return res.status(400).json({
@@ -140,12 +129,12 @@ router.post('/create-payhere-checkout', async (req, res) => {
       });
     }
 
-    const { dueAmount } = calculateAmounts();
-    const gatewayAmount = calculateDisplayAmount(dueAmount, selectedCurrency);
+    const computedOrder = calculateOrder(order);
+    const gatewayAmount = calculateDisplayAmount(computedOrder.dueAmount, selectedCurrency);
 
     const payment = await Payment.create({
       orderId: createOrderId(),
-      amount: dueAmount,
+      amount: computedOrder.dueAmount,
       currency: selectedCurrency,
       paymentMethod: 'card',
       status: 'pending'
@@ -182,7 +171,17 @@ router.post('/create-payhere-checkout', async (req, res) => {
       payhereMd5sig: hash,
       metadata: {
         checkoutAmount: gatewayAmount,
-        checkoutCurrency: selectedCurrency
+        checkoutCurrency: selectedCurrency,
+        order: computedOrder,
+        customer: {
+          firstName: customer.firstName || 'Vivid',
+          lastName: customer.lastName || 'Arts Customer',
+          email: customer.email || null,
+          phone: customer.phone || null,
+          address: customer.address || null,
+          city: customer.city || null,
+          country: customer.country || null
+        }
       }
     });
 
@@ -258,6 +257,12 @@ router.post('/payhere-notify', async (req, res) => {
       }
     });
 
+    if (payment.status === 'completed') {
+      ensureInvoiceGenerated(payment).catch((err) => {
+        console.error('Invoice generation failed:', err);
+      });
+    }
+
     res.send('OK');
   } catch (error) {
     console.error('PayHere notification error:', error);
@@ -305,6 +310,10 @@ router.post('/process', async (req, res) => {
       metadata: result
     });
 
+    ensureInvoiceGenerated(payment).catch((err) => {
+      console.error('Invoice generation failed:', err);
+    });
+
     res.json({
       success: true,
       payment: {
@@ -326,12 +335,11 @@ router.post('/process', async (req, res) => {
 
 // 5. Get Prices (must be before /:orderId to avoid route conflicts)
 router.get('/prices', (req, res) => {
-  const { total, dueAmount } = calculateAmounts();
   res.json({
     success: true,
-    prices: PRICES,
-    total,
-    dueAmount,
+    sizes: SIZES,
+    frames: FRAMES,
+    extraPersonPrice: EXTRA_PERSON_PRICE,
     currencies: CURRENCIES
   });
 });
@@ -371,7 +379,37 @@ router.get('/status/:orderId', async (req, res) => {
   }
 });
 
-// 7. Get All Payments (for admin)
+// 7. Download invoice PDF (available once payment is completed)
+router.get('/:orderId/invoice', async (req, res) => {
+  try {
+    const payment = await Payment.findOne({ where: { orderId: req.params.orderId } });
+
+    if (!payment) {
+      return res.status(404).json({
+        success: false,
+        error: 'Order not found'
+      });
+    }
+
+    if (payment.status !== 'completed') {
+      return res.status(409).json({
+        success: false,
+        error: 'Invoice is only available once the payment is completed'
+      });
+    }
+
+    const filePath = await ensureInvoiceGenerated(payment);
+    res.download(filePath, `invoice-${payment.orderId}.pdf`);
+  } catch (error) {
+    console.error('Error generating invoice:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to generate invoice'
+    });
+  }
+});
+
+// 8. Get All Payments (for admin)
 router.get('/', async (req, res) => {
   try {
     const payments = await Payment.findAll({
