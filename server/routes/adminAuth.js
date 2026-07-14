@@ -1,7 +1,11 @@
 const express = require('express');
-const router = express.Router();
-const db = require('../models');
+const router  = express.Router();
+const db      = require('../models');
 
+// ── POST /api/admin/register ──────────────────────────────────────────────────
+// Creates a new admin account and stores it in the Admins table.
+// In production you would restrict this endpoint (e.g. only allow if zero admins exist,
+// or protect it with a secret registration token).
 router.post('/register', async (req, res) => {
   try {
     const { username, password, firstName, lastName, email, phone } = req.body;
@@ -14,27 +18,37 @@ router.post('/register', async (req, res) => {
     }
 
     const existing = await db.Admin.findOne({ where: { username } });
-    if (existing) return res.status(409).json({ error: 'Username already taken' });
+    if (existing) {
+      return res.status(409).json({ error: 'Username already taken' });
+    }
 
     const emailUsed = await db.Admin.findOne({ where: { email } });
-    if (emailUsed) return res.status(409).json({ error: 'Email already registered' });
+    if (emailUsed) {
+      return res.status(409).json({ error: 'Email already registered' });
+    }
 
     const admin = await db.Admin.create({
       username,
       passwordHash: await db.Admin.hashPassword(password),
-      firstName: firstName || '',
-      lastName: lastName || '',
+      firstName:    firstName || '',
+      lastName:     lastName  || '',
       email,
-      phone: phone || null,
+      phone:        phone || null,
     });
 
+    // Log in automatically after registering
     req.session.adminId = admin.id;
-    res.status(201).json({ message: 'Admin account created', admin: safeAdmin(admin) });
+
+    res.status(201).json({
+      message: 'Admin account created',
+      admin: safeAdmin(admin),
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// ── POST /api/admin/login ─────────────────────────────────────────────────────
 router.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -54,15 +68,19 @@ router.post('/login', async (req, res) => {
   }
 });
 
+// ── POST /api/admin/logout ────────────────────────────────────────────────────
 router.post('/logout', (req, res) => {
   req.session.destroy(() => res.json({ message: 'Logged out' }));
 });
 
+// ── GET /api/admin/me ─────────────────────────────────────────────────────────
+// Called on page load — returns the logged-in admin's data so the
+// frontend can show real details (name, businessName etc.) immediately.
+// Returns 401 if no session → frontend redirects to /admin/login.
 router.get('/me', async (req, res) => {
   if (!req.session?.adminId) {
     return res.status(401).json({ error: 'Not authenticated' });
   }
-
   try {
     const admin = await db.Admin.findByPk(req.session.adminId, {
       attributes: { exclude: ['passwordHash'] },
@@ -74,24 +92,43 @@ router.get('/me', async (req, res) => {
   }
 });
 
-router.get('/orders', requireAdmin, async (req, res) => {
+// ── PATCH /api/admin/profile ──────────────────────────────────────────────────
+router.patch('/profile', requireAdmin, async (req, res) => {
   try {
-    const orders = [];
-    res.json({ orders });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    const admin = await db.Admin.findByPk(req.session.adminId);
+    const { firstName, lastName, email, phone } = req.body;
+    await admin.update({ firstName, lastName, email, phone });
+    res.json({ message: 'Profile updated', admin: safeAdmin(admin) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-router.get('/customers', requireAdmin, async (req, res) => {
+// ── PATCH /api/admin/business ─────────────────────────────────────────────────
+router.patch('/business', requireAdmin, async (req, res) => {
   try {
-    const customers = await db.customers?.findAll?.({ attributes: ['id', 'fullName', 'email', 'phone'] }) || [];
-    res.json(customers);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    const admin = await db.Admin.findByPk(req.session.adminId);
+    const { businessName, businessEmail, businessAddress } = req.body;
+    await admin.update({ businessName, businessEmail, businessAddress });
+    res.json({ message: 'Business info updated' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── PATCH /api/admin/password ─────────────────────────────────────────────────
+router.patch('/password', requireAdmin, async (req, res) => {
+  try {
+    const admin = await db.Admin.findByPk(req.session.adminId);
+    const { currentPassword, newPassword } = req.body;
+    if (!(await admin.checkPassword(currentPassword))) {
+      return res.status(400).json({ error: 'Current password is incorrect' });
+    }
+    if (!newPassword || newPassword.length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters' });
+    }
+    await admin.update({ passwordHash: await db.Admin.hashPassword(newPassword) });
+    res.json({ message: 'Password updated' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── helpers ───────────────────────────────────────────────────────────────────
 function requireAdmin(req, res, next) {
   if (!req.session?.adminId) return res.status(401).json({ error: 'Unauthorized' });
   next();
