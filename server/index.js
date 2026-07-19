@@ -9,9 +9,8 @@ const cors = require('cors');
 app.use(express.json()); // Middleware to parse JSON bodies
 app.use(express.urlencoded({ extended: true })); // Middleware to parse form-encoded bodies (e.g. PayHere webhook)
 app.use(cors({
-    origin: 'http://localhost:3000', // Allow requests from this origin
-    credentials: true, // Allow cookies to be sent
-
+    origin: ['http://localhost:3000', 'http://localhost:5173', 'http://127.0.0.1:5173'],
+    credentials: true,
 })); // Enable CORS for all routes
 
 app.use(session({
