@@ -23,24 +23,24 @@ app.use(session({
         maxAge:   1000 * 60 * 60 * 8,
     } // Set to true if using HTTPS
 }));
+
 const db = require('./models');
 
-//Routers
+// Routers
 const customerRouter = require('./routes/Customer');
-const paymentRouter = require('./routes/Payment');
+const paymentRouter  = require('./routes/Payment');
 const adminAuthRouter = require('./routes/adminAuth');
+const ordersRouter    = require('./routes/Orders'); // 🟢 1. Orders Router එක එකතු කළා
+
 app.use("/api/customers", customerRouter);
 app.use("/api/payments", paymentRouter);
 app.use('/api/admin', adminAuthRouter);
-
+app.use('/api/orders', ordersRouter); // 🟢 2. Orders Route එක register කළා
 
 db.sequelize.sync({ alter: true }).then(() => {
-    app.listen(3001,() =>{
-
+    app.listen(3001, () => {
         console.log('Server is running on port 3001');
     });
 }).catch((err) => {
     console.error('Unable to connect to the database:', err);
 });
-
-app.use(express.json());
