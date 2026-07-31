@@ -6,6 +6,9 @@ const { uploadProof }          = require('../middleware/upload');
 const { sendProofReadyEmail, sendStatusUpdateEmail } = require('../middleware/email');
 const { calculatePrice, loadPrices }                = require('../middleware/pricingEngine');
 
+// 💡 Importing the Notification Helper
+const { createNotification } = require('../utils/notificationHelper');
+
 // ─── Auth middleware ─────────────────────────────────────────────────────────
 const requireAdmin = (req, res, next) => {
   if (!req.session?.adminId) return res.status(401).json({ error: 'Unauthorized' });
@@ -162,9 +165,7 @@ router.patch('/pricing/:id', requireAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /admin/pricing/calculate  — live price calculation for any option combo
-// The frontend calls this when the customer order form changes so it can show
-// an accurate price preview before submitting.
+// POST /admin/pricing/calculate
 router.post('/pricing/calculate', async (req, res) => {
   try {
     const { paperSize, subjectCount, frameType, pickupOption, isUrgent } = req.body;
@@ -174,7 +175,7 @@ router.post('/pricing/calculate', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// ORDERS (unchanged from before — kept here so the file is complete)
+// ORDERS
 // ════════════════════════════════════════════════════════════════════════════
 
 router.get('/orders', requireAdmin, async (req, res) => {
@@ -207,9 +208,10 @@ router.get('/orders/:id', requireAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// 💡 status update වෙන තැනට Notification හදන කෑල්ල එකතු කර ඇත
 router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
   try {
-    const { status } = req.body;
+    const { status, customMessage } = req.body;
     const valid = ['in_queue','sketching','waiting_for_feedback','finished','framed','shipped','done'];
     if (!valid.includes(status)) return res.status(400).json({ error: 'Invalid status' });
 
@@ -226,8 +228,34 @@ router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
       await db.Message.create({ orderId: order.id, senderType: 'system', message: `📍 Your order is ready for pickup! Location: ${location}` });
     }
 
+    // Email යැවීම
     await sendStatusUpdateEmail(order.customer.email, order.customer.fullName, order.id, status);
-    res.json({ message: 'Status updated', order });
+
+    // Notification එක සෑදීම
+    let title = '📌 Order Status Updated';
+    let message = customMessage || `Your order status has been updated to ${status}.`;
+
+    if (status === 'sketching') {
+      title = '🎨 Artist Started Sketching!';
+      message = customMessage || 'Our artist has started working on your pencil portrait!';
+    } else if (status === 'waiting_for_feedback') {
+      title = '🖼️ Portrait Proof Ready!';
+      message = customMessage || 'Your portrait drawing is complete! Please review the proof image.';
+    } else if (status === 'finished' || status === 'framed') {
+      title = '✨ Portrait Finished & Framed!';
+      message = customMessage || 'Your portrait drawing is completed and framed perfectly.';
+    } else if (status === 'shipped') {
+      title = '📦 Order Dispatched / Ready!';
+      message = customMessage || 'Your portrait package is on its way or ready for pickup!';
+    } else if (status === 'done') {
+      title = '🎉 Order Completed!';
+      message = customMessage || 'Your portrait order has been delivered and completed!';
+    }
+
+    // Database එකේ Notification එක Save කිරීම
+    await createNotification(order.customerId, order.id, title, message, status);
+
+    res.json({ message: 'Status updated and notification created', order });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -248,6 +276,16 @@ router.post('/orders/:id/proof', requireAdmin, (req, res) => {
       });
       await db.Message.create({ orderId: order.id, senderType: 'system', message: 'The artist has uploaded your proof image. Please review and approve or request changes.' });
       await sendProofReadyEmail(order.customer.email, order.customer.fullName, order.id);
+
+      // 💡 Proof එක Upload කළාමත් Customer ට Notification එකක් යනවා
+      await createNotification(
+        order.customerId, 
+        order.id, 
+        '🖼️ New Proof Image Uploaded', 
+        'The artist has uploaded a proof of your portrait! Please check and give feedback.', 
+        'waiting_for_feedback'
+      );
+
       res.json({ message: 'Proof uploaded, customer notified', proofUrl: order.proofImagePath });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });

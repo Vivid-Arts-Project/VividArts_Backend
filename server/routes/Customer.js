@@ -3,6 +3,9 @@ const router = express.Router();
 const bcrypt = require('bcrypt');
 const { Customer } = require('../models');
 
+// 💡 Importing the Notification Model
+const Notification = require('../models/Notification');
+
 const createToken = (customer) => Buffer.from(`${customer.customer_id}:${customer.email}`).toString('base64');
 const decodeToken = (token) => {
   try {
@@ -157,6 +160,60 @@ router.put('/profile', async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ message: error.message || 'Unable to update profile.' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// NOTIFICATIONS APIS (අලුතින් එකතු කළ කොටස)
+// ════════════════════════════════════════════════════════════════════════════
+
+// GET /notifications — Customer ගේ Notifications ලබා ගැනීම
+router.get('/notifications', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+
+    if (!token) {
+      return res.status(401).json({ message: 'Authentication token missing.' });
+    }
+
+    const decoded = decodeToken(token);
+    if (!decoded || !decoded.customerId) {
+      return res.status(401).json({ message: 'Invalid authentication token.' });
+    }
+
+    // Receiving the latest notifications related to the Customer ID
+    const notifications = await Notification.find({ customerId: decoded.customerId }).sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      notifications,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message || 'Failed to fetch notifications.' });
+  }
+});
+
+// PUT /notifications/:id/read — Notification එක Read කළ බව Mark කිරීම
+router.put('/notifications/:id/read', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+
+    if (!token) {
+      return res.status(401).json({ message: 'Authentication token missing.' });
+    }
+
+    const decoded = decodeToken(token);
+    if (!decoded || !decoded.customerId) {
+      return res.status(401).json({ message: 'Invalid authentication token.' });
+    }
+
+    await Notification.findByIdAndUpdate(req.params.id, { isRead: true });
+
+    res.json({ success: true, message: 'Notification marked as read.' });
+  } catch (error) {
+    res.status(500).json({ message: error.message || 'Failed to update notification status.' });
   }
 });
 
