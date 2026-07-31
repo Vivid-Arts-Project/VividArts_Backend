@@ -150,8 +150,8 @@ router.post('/create-payhere-checkout', async (req, res) => {
 
     const checkoutFields = {
       merchant_id: PAYHERE_MERCHANT_ID,
-      return_url: `${FRONTEND_URL}/?payment=success&order_id=${payment.orderId}`,
-      cancel_url: `${FRONTEND_URL}/?payment=cancelled&order_id=${payment.orderId}`,
+      return_url: `${FRONTEND_URL}/commission/payment?payment=success&order_id=${payment.orderId}`,
+      cancel_url: `${FRONTEND_URL}/commission/payment?payment=cancelled&order_id=${payment.orderId}`,
       notify_url: `${BACKEND_URL}/api/payments/payhere-notify`,
       order_id: payment.orderId,
       items: 'Vivid Arts portrait deposit',
