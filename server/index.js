@@ -46,7 +46,7 @@ app.use('/api/orders', ordersRouter);
 // ── 6. Sync DB and start ──────────────────────────────────────────────────────
 // Create any missing tables once on startup without resetting existing data.
 db.sequelize.authenticate()
-  .then(() => db.sequelize.sync({ force: false, alter: false }))
+  
   .then(() => {
     app.listen(3001, () => console.log('✓ Server running on http://localhost:3001'));
   })
