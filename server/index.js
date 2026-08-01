@@ -2,45 +2,50 @@ require('dotenv').config();
 
 const express = require('express');
 const session = require('express-session');
-const path    = require('path');
-const app = express();
-const cors = require('cors');
+const cors    = require('cors');
+const app     = express();
 
-app.use(express.json()); // Middleware to parse JSON bodies
-app.use(express.urlencoded({ extended: true })); // Middleware to parse form-encoded bodies (e.g. PayHere webhook)
+// ── 1. Body parsers ───────────────────────────────────────────────────────────
+app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // needed for PayHere webhook
+
+// ── 2. CORS ───────────────────────────────────────────────────────────────────
 app.use(cors({
-    origin: ['http://localhost:3000', 'http://localhost:5173', 'http://127.0.0.1:5173'],
-    credentials: true,
-})); // Enable CORS for all routes
-
-app.use(session({
-    secret: process.env.SESSION_SECRET || 'default_secret',
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-        httpOnly: true,       // JS cannot read the cookie — security best practice
-        secure:   false,      // set true when you deploy with HTTPS
-        maxAge:   1000 * 60 * 60 * 8,
-    } // Set to true if using HTTPS
+  origin: ['http://localhost:3000', 'http://localhost:5173', 'http://127.0.0.1:5173'],
+  credentials: true, // required so session cookie is sent with every request
 }));
+
+// ── 3. Session (MUST come before any route that reads req.session) ─────────────
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'change_this_in_production',
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    secure: false,              // set true when running on HTTPS
+    maxAge: 1000 * 60 * 60 * 8, // 8 hours
+  },
+}));
+
+// ── 4. Database ───────────────────────────────────────────────────────────────
 const db = require('./models');
 
-//Routers
-const customerRouter = require('./routes/Customer');
-const paymentRouter = require('./routes/Payment');
-const adminAuthRouter = require('./routes/adminAuth');
-app.use("/api/customers", customerRouter);
-app.use("/api/payments", paymentRouter);
-app.use('/api/admin', adminAuthRouter);
+// ── 5. Routes ─────────────────────────────────────────────────────────────────
+const customerRouter  = require('./routes/Customer');
+const paymentRouter   = require('./routes/Payment');
+const adminAuthRouter = require('./routes/adminAuth');  // login, register, /me
+const adminRouter     = require('./routes/admin');       // orders, proofs, pricing
+const ordersRouter = require('./routes/orders');
 
+app.use('/api/customers', customerRouter);
+app.use('/api/payments',  paymentRouter);
+app.use('/api/admin',     adminAuthRouter); // POST /api/admin/login etc.
+app.use('/api/admin',     adminRouter);     // GET  /api/admin/orders etc.
+app.use('/api/orders', ordersRouter);
 
+// ── 6. Sync DB and start ──────────────────────────────────────────────────────
+// alter:true adds new columns / tables without dropping existing data.
+// Switch to migrations before going to production.
 db.sequelize.sync({ alter: true }).then(() => {
-    app.listen(3001,() =>{
-
-        console.log('Server is running on port 3001');
-    });
-}).catch((err) => {
-    console.error('Unable to connect to the database:', err);
-});
-
-app.use(express.json());
+  app.listen(3001, () => console.log('✓ Server running on http://localhost:3001'));
+}).catch(err => console.error('✗ DB connection failed:', err));
