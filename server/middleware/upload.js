@@ -45,6 +45,28 @@ const refStorage = new CloudinaryStorage({
   }),
 });
 
+// ─── Profile image storage (avatars) ───────────────────────────────────────
+const profileStorage = new CloudinaryStorage({
+  cloudinary,
+  params: (req, file) => ({
+    folder: 'art-studio/profiles',
+    public_id: `profile_${req.decodedCustomerId || 'unknown'}_${Date.now()}`,
+    allowed_formats: ['jpg', 'jpeg', 'png', 'webp'],
+    transformation: [{ width: 512, height: 512, crop: 'fill', quality: 'auto', fetch_format: 'auto' }],
+  }),
+});
+
+// ─── Cover image storage ───────────────────────────────────────────────────
+const coverStorage = new CloudinaryStorage({
+  cloudinary,
+  params: (req, file) => ({
+    folder: 'art-studio/covers',
+    public_id: `cover_${req.decodedCustomerId || 'unknown'}_${Date.now()}`,
+    allowed_formats: ['jpg', 'jpeg', 'png', 'webp'],
+    transformation: [{ quality: 'auto', fetch_format: 'auto' }],
+  }),
+});
+
 // ─── Multer instances ────────────────────────────────────────────────────────
 // multer-storage-cloudinary streams files directly to Cloudinary.
 // req.file.path  → the full Cloudinary HTTPS URL  (use this to save in DB)
@@ -62,6 +84,18 @@ const uploadReferences = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
 }).array('referencePhotos', 5);
 
+const uploadProfile = multer({
+  storage: profileStorage,
+  fileFilter: imageFilter,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+}).single('profileImage');
+
+const uploadCover = multer({
+  storage: coverStorage,
+  fileFilter: imageFilter,
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
+}).single('coverImage');
+
 // ─── Helper: delete an image from Cloudinary by its public_id ───────────────
 // Use this if you ever need to replace or remove a stored image.
 // public_id is stored in req.file.filename after upload.
@@ -70,4 +104,4 @@ const deleteImage = async (publicId) => {
   await cloudinary.uploader.destroy(publicId);
 };
 
-module.exports = { uploadProof, uploadReferences, deleteImage, cloudinary };
+module.exports = { uploadProof, uploadReferences, uploadProfile, uploadCover, deleteImage, cloudinary };
