@@ -44,8 +44,10 @@ app.use('/api/admin',     adminRouter);     // GET  /api/admin/orders etc.
 app.use('/api/orders', ordersRouter);
 
 // ── 6. Sync DB and start ──────────────────────────────────────────────────────
-// alter:true adds new columns / tables without dropping existing data.
-// Switch to migrations before going to production.
-db.sequelize.sync({ alter: true }).then(() => {
+// Verify the connection without mutating the schema on every restart.
+// This project has cyclic model references, for which Sequelize sync() performs
+// an internal alter pass that can repeatedly create duplicate MySQL indexes.
+// Apply schema changes with migrations instead.
+db.sequelize.authenticate().then(() => {
   app.listen(3001, () => console.log('✓ Server running on http://localhost:3001'));
 }).catch(err => console.error('✗ DB connection failed:', err));
