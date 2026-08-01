@@ -1,18 +1,21 @@
 const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 const { Customer } = require('../models');
 
 // 💡 Importing the Notification Model
 const Notification = require('../models/Notification');
 
-const createToken = (customer) => Buffer.from(`${customer.customer_id}:${customer.email}`).toString('base64');
+const createToken = (customer) => jwt.sign(
+  { customerId: customer.customer_id, email: customer.email },
+  process.env.JWT_SECRET,
+  { expiresIn: '8h' }
+);
 const decodeToken = (token) => {
   try {
-    const decoded = Buffer.from(token, 'base64').toString('utf8');
-    const [customerId, email] = decoded.split(':');
-    return { customerId: Number(customerId), email };
-  } catch (error) {
+    return jwt.verify(token, process.env.JWT_SECRET);
+  } catch {
     return null;
   }
 };
@@ -116,7 +119,10 @@ router.get('/profile', async (req, res) => {
     res.json({
       customer_id: customer.customer_id,
       username: customer.username,
+      full_name: customer.full_name,
       email: customer.email,
+      phone_number: customer.phone_number,
+      address: customer.address,
       role: 'customer',
     });
   } catch (error) {
