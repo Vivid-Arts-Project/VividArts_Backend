@@ -45,6 +45,23 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.STRING,
       allowNull: true,
     },
+    // Profile images stored on Cloudinary (optional)
+    profile_image_url: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    profile_image_public_id: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    cover_image_url: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    cover_image_public_id: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
   }, {
     tableName: 'Customers',
     // Let Sequelize manage createdAt and updatedAt automatically.

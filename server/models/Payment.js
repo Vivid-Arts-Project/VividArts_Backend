@@ -23,7 +23,6 @@ module.exports = (sequelize, DataTypes) => {
     payhereOrderId: {
       type: DataTypes.STRING,
       allowNull: true,
-      unique: true,
     },
 
     amount: {

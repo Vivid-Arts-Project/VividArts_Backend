@@ -3,18 +3,23 @@ const router = express.Router();
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { Customer } = require('../models');
+const { Op } = require('sequelize');
+
+const { uploadProfile, uploadCover, deleteImage } = require('../middleware/upload');
 
 // 💡 Importing the Notification Model
 const Notification = require('../models/Notification');
 
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
+
 const createToken = (customer) => jwt.sign(
   { customerId: customer.customer_id, email: customer.email },
-  process.env.JWT_SECRET,
+  JWT_SECRET,
   { expiresIn: '8h' }
 );
 const decodeToken = (token) => {
   try {
-    return jwt.verify(token, process.env.JWT_SECRET);
+    return jwt.verify(token, JWT_SECRET);
   } catch {
     return null;
   }
@@ -33,53 +38,79 @@ router.post('/', async (req, res) => {
 
 router.post('/register', async (req, res) => {
   try {
-    const { username, email, password } = req.body;
+    const { username, email, password, confirmPassword } = req.body;
 
-    if (!username || !email || !password) {
-      return res.status(400).json({ message: 'Username, email and password are required.' });
+    if (!username || !email || !password || !confirmPassword) {
+      return res.status(400).json({ message: 'Username, email, password and confirmation are required.' });
     }
 
-    const existingCustomer = await Customer.findOne({ where: { email } });
-    if (existingCustomer) {
-      return res.status(409).json({ message: 'An account with this email already exists.' });
+    if (password !== confirmPassword) {
+      return res.status(400).json({ message: 'Passwords do not match.' });
     }
 
-    const hashedPassword = await bcrypt.hash(password, 10);
+    const normalizedEmail = email.trim().toLowerCase();
+    const normalizedUsername = username.trim();
+
+    if (!normalizedUsername || !normalizedEmail) {
+      return res.status(400).json({ message: 'Username and email cannot be blank.' });
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({ message: 'Password must be at least 8 characters long.' });
+    }
+
+    // Four rounds keep this classroom/local project responsive while passwords
+    // are still stored as bcrypt hashes rather than plain text.
+    const HASH_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS, 10) || 4;
+    const hashedPassword = await bcrypt.hash(password, HASH_ROUNDS);
+
+    // The database's unique username/email rules detect duplicate accounts.
+    // Creating directly avoids an extra database lookup before every register.
     const newCustomer = await Customer.create({
-      username,
-      email,
+      username: normalizedUsername,
+      email: normalizedEmail,
       password_hash: hashedPassword,
-      full_name: username,
+      full_name: normalizedUsername,
       address: 'N/A',
       phone_number: 'N/A',
-      created_at: new Date(),
     });
 
     res.status(201).json({
       message: 'Registration successful.',
       customerId: newCustomer.customer_id,
+      customer: { username: newCustomer.username, email: newCustomer.email },
     });
   } catch (error) {
-    res.status(500).json({ message: error.message || 'Registration failed.' });
+    if (error.name === 'SequelizeUniqueConstraintError') {
+      return res.status(409).json({ message: 'An account with this username or email already exists.' });
+    }
+    if (error.name === 'SequelizeValidationError') {
+      return res.status(400).json({ message: error.errors[0]?.message || 'Please enter valid account details.' });
+    }
+    res.status(500).json({ message: 'Registration failed. Please try again.' });
   }
 });
 
 router.post('/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { username, password } = req.body;
 
-    if (!email || !password) {
-      return res.status(400).json({ message: 'Email and password are required.' });
+    if (!username || !password) {
+      return res.status(400).json({ message: 'Username (or email) and password are required.' });
     }
 
-    const customer = await Customer.findOne({ where: { email } });
+    const identifier = username.trim();
+    // Allow login by username or email. Emails are stored in lower case.
+    const customer = await Customer.findOne({
+      where: { [Op.or]: [{ username: identifier }, { email: identifier.toLowerCase() }] },
+    });
     if (!customer) {
-      return res.status(401).json({ message: 'Invalid email or password.' });
+      return res.status(401).json({ message: 'Invalid username/email or password.' });
     }
 
     const passwordMatch = await bcrypt.compare(password, customer.password_hash);
     if (!passwordMatch) {
-      return res.status(401).json({ message: 'Invalid email or password.' });
+      return res.status(401).json({ message: 'Invalid username or password.' });
     }
 
     const token = createToken(customer);
@@ -93,7 +124,7 @@ router.post('/login', async (req, res) => {
       },
     });
   } catch (error) {
-    res.status(500).json({ message: error.message || 'Login failed.' });
+    res.status(500).json({ message: 'Login failed. Please try again.' });
   }
 });
 
@@ -123,10 +154,82 @@ router.get('/profile', async (req, res) => {
       email: customer.email,
       phone_number: customer.phone_number,
       address: customer.address,
+      profile_image_url: customer.profile_image_url || null,
+      cover_image_url: customer.cover_image_url || null,
       role: 'customer',
     });
   } catch (error) {
     res.status(500).json({ message: error.message || 'Unable to load profile.' });
+  }
+});
+
+// POST /profile/avatar — upload or replace profile (avatar) image
+router.post('/profile/avatar', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (!token) return res.status(401).json({ message: 'Authentication token missing.' });
+
+    const decoded = decodeToken(token);
+    if (!decoded || !decoded.customerId) return res.status(401).json({ message: 'Invalid authentication token.' });
+
+    // Make the decoded id available to multer/cloudinary storage public_id generator
+    req.decodedCustomerId = decoded.customerId;
+
+    uploadProfile(req, res, async (err) => {
+      if (err) return res.status(400).json({ message: err.message || 'Upload failed.' });
+      if (!req.file) return res.status(400).json({ message: 'No file uploaded.' });
+
+      const customer = await Customer.findByPk(decoded.customerId);
+      if (!customer) return res.status(404).json({ message: 'Customer not found.' });
+
+      const previousPublicId = customer.profile_image_public_id;
+
+      customer.profile_image_url = req.file.path;
+      customer.profile_image_public_id = req.file.filename;
+      await customer.save();
+
+      // attempt to delete previous image (best-effort)
+      try { if (previousPublicId && previousPublicId !== req.file.filename) await deleteImage(previousPublicId); } catch (e) { /* ignore */ }
+
+      res.json({ message: 'Profile image updated.', profile_image_url: customer.profile_image_url });
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message || 'Unable to upload profile image.' });
+  }
+});
+
+// POST /profile/cover — upload or replace cover image
+router.post('/profile/cover', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (!token) return res.status(401).json({ message: 'Authentication token missing.' });
+
+    const decoded = decodeToken(token);
+    if (!decoded || !decoded.customerId) return res.status(401).json({ message: 'Invalid authentication token.' });
+
+    req.decodedCustomerId = decoded.customerId;
+
+    uploadCover(req, res, async (err) => {
+      if (err) return res.status(400).json({ message: err.message || 'Upload failed.' });
+      if (!req.file) return res.status(400).json({ message: 'No file uploaded.' });
+
+      const customer = await Customer.findByPk(decoded.customerId);
+      if (!customer) return res.status(404).json({ message: 'Customer not found.' });
+
+      const previousPublicId = customer.cover_image_public_id;
+
+      customer.cover_image_url = req.file.path;
+      customer.cover_image_public_id = req.file.filename;
+      await customer.save();
+
+      try { if (previousPublicId && previousPublicId !== req.file.filename) await deleteImage(previousPublicId); } catch (e) { /* ignore */ }
+
+      res.json({ message: 'Cover image updated.', cover_image_url: customer.cover_image_url });
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message || 'Unable to upload cover image.' });
   }
 });
 
