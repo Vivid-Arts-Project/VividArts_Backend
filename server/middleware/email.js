@@ -97,6 +97,7 @@ async function sendStatusUpdateEmail(email, customerName, orderId, status) {
 }
 
 module.exports = {
+  sendEmail,
   sendProofReadyEmail,
   sendStatusUpdateEmail,
 };
