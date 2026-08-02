@@ -67,7 +67,8 @@ router.post('/register/send-otp', async (req, res) => {
       html: `<p>Your Vivid Arts verification code is <strong style="font-size:20px;letter-spacing:3px">${code}</strong>.</p><p>This code expires in 10 minutes.</p>`,
     });
 
-    if (delivery.skipped) {
+    const isDevelopment = process.env.NODE_ENV === 'development';
+    if (delivery.skipped && !isDevelopment) {
       return res.status(503).json({ message: 'Email verification is not configured. Add SMTP settings to the backend .env file.' });
     }
 
@@ -77,6 +78,14 @@ router.post('/register/send-otp', async (req, res) => {
       expiresAt: Date.now() + OTP_LIFETIME_MS,
       attempts: 0,
     });
+    if (delivery.skipped) {
+      console.warn(`[auth] Development verification code for ${email}: ${code}`);
+      return res.json({
+        message: 'Development mode: use the verification code shown below.',
+        developmentCode: code,
+      });
+    }
+
     res.json({ message: 'Verification code sent. Check your email.' });
   } catch (error) {
     res.status(500).json({ message: 'Unable to send the verification code. Please try again.' });
