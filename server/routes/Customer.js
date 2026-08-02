@@ -124,6 +124,7 @@ router.post('/login', async (req, res) => {
       },
     });
   } catch (error) {
+    console.error('Customer login failed:', error);
     res.status(500).json({ message: 'Login failed. Please try again.' });
   }
 });

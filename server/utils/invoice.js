@@ -4,6 +4,7 @@ const PDFDocument = require('pdfkit');
 const { calculateOrder } = require('./pricing');
 
 const INVOICES_DIR = path.join(__dirname, '..', 'invoices');
+const LOGO_PATH = path.join(__dirname, '..', 'assets', 'vivid-arts-logo.png');
 
 const CURRENCY_SYMBOLS = {
   LKR: 'Rs',
@@ -25,6 +26,16 @@ function drawRow(doc, y, label, value, { bold = false } = {}) {
   doc.text(value, 0, y, { align: 'right' });
 }
 
+function drawLogoMark(doc, x, y, width = 64, height = 34) {
+  if (!fs.existsSync(LOGO_PATH)) return;
+
+  const imageWidth = width / 0.743;
+  doc.save();
+  doc.rect(x, y, width, height).clip();
+  doc.image(LOGO_PATH, x - imageWidth * 0.132, y - imageWidth * 0.253, { width: imageWidth });
+  doc.restore();
+}
+
 async function renderInvoice(doc, payment) {
   const metadata = payment.metadata || {};
   const customer = metadata.customer || {};
@@ -36,12 +47,13 @@ async function renderInvoice(doc, payment) {
   const issuedAt = payment.updatedAt || payment.createdAt || new Date();
 
   // Header
-  doc.font('Helvetica-Bold').fontSize(20).fillColor('#1a1a2e').text('VIVID ARTS', 50, 50);
-  doc.font('Helvetica').fontSize(10).fillColor('#6b6b80').text('Pencil portrait commissions', 50, 74);
+  drawLogoMark(doc, 50, 42);
+  doc.font('Helvetica-Bold').fontSize(20).fillColor('#1a1a2e').text('VIVID ARTS', 126, 43);
+  doc.font('Helvetica').fontSize(10).fillColor('#6b6b80').text('Pencil portrait commissions', 126, 68);
 
   doc.font('Helvetica-Bold').fontSize(16).fillColor('#1a1a2e').text('INVOICE', 0, 50, { align: 'right' });
   doc.font('Helvetica').fontSize(10).fillColor('#6b6b80')
-    .text(`Invoice #: ${payment.orderId}`, 0, 74, { align: 'right' })
+    .text(`Invoice #: ${payment.payhereOrderId}`, 0, 74, { align: 'right' })
     .text(`Date: ${new Date(issuedAt).toLocaleDateString()}`, 0, 88, { align: 'right' });
 
   doc.moveTo(50, 110).lineTo(545, 110).strokeColor('#e5e4e7').stroke();
@@ -117,9 +129,11 @@ async function generateInvoiceBuffer(payment) {
 
 async function ensureInvoiceGenerated(payment) {
   fs.mkdirSync(INVOICES_DIR, { recursive: true });
-  const filePath = invoicePath(payment.orderId);
+  const filePath = invoicePath(payment.payhereOrderId);
+  const logoUpdatedAt = fs.existsSync(LOGO_PATH) ? fs.statSync(LOGO_PATH).mtimeMs : 0;
+  const invoiceUpdatedAt = fs.existsSync(filePath) ? fs.statSync(filePath).mtimeMs : 0;
 
-  if (!fs.existsSync(filePath)) {
+  if (!fs.existsSync(filePath) || invoiceUpdatedAt < logoUpdatedAt) {
     const buffer = await generateInvoiceBuffer(payment);
     fs.writeFileSync(filePath, buffer);
   }
