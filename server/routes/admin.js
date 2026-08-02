@@ -135,7 +135,7 @@ router.get('/pricing', requireAdmin, async (req, res) => {
     // Also send a live preview of a typical order so the admin can see impact of changes
     const preview = await calculatePrice({
       paperSize: 'A3', subjectCount: 'one',
-      frameType: 'without_frame', pickupOption: 'pickup', isUrgent: false,
+      frameType: 'without_frame', pickupOption: 'courier', isUrgent: false,
     });
 
     res.json({ rows, preview });
