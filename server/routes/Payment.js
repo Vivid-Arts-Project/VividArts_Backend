@@ -270,6 +270,49 @@ router.post('/payhere-notify', async (req, res) => {
   }
 });
 
+// PayHere cannot post its server notification to localhost during local
+// development. The browser return is therefore used only in development
+// sandbox mode so the complete checkout and invoice flow can be tested.
+// Production payments must always be confirmed by /payhere-notify above.
+router.post('/sandbox-confirm-return/:orderId', async (req, res) => {
+  try {
+    if (process.env.NODE_ENV !== 'development' || process.env.PAYHERE_SANDBOX === 'false') {
+      return res.status(404).json({ success: false, error: 'Not found' });
+    }
+
+    const payment = await Payment.findOne({
+      where: { payhereOrderId: req.params.orderId },
+    });
+    if (!payment) {
+      return res.status(404).json({ success: false, error: 'Order not found' });
+    }
+
+    if (payment.status === 'pending') {
+      await payment.update({
+        status: 'completed',
+        transactionId: payment.transactionId || `SANDBOX-${Date.now()}`,
+        metadata: {
+          ...(payment.metadata || {}),
+          sandboxConfirmedFromReturn: true,
+        },
+      });
+    }
+
+    await ensureInvoiceGenerated(payment);
+    res.json({
+      success: true,
+      payment: {
+        orderId: payment.payhereOrderId,
+        status: payment.status,
+        transactionId: payment.transactionId,
+      },
+    });
+  } catch (error) {
+    console.error('Sandbox return confirmation error:', error);
+    res.status(500).json({ success: false, error: 'Unable to confirm sandbox payment' });
+  }
+});
+
 // 4. Process bank transfer payments
 router.post('/process', async (req, res) => {
   try {
