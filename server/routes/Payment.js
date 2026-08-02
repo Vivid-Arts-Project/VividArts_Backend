@@ -158,7 +158,7 @@ router.post('/create-payhere-checkout', async (req, res) => {
       currency: selectedCurrency,
       amount: gatewayAmount,
       first_name: customer.firstName || 'Vivid',
-      last_name: customer.lastName || 'Arts Customer',
+      last_name: customer.lastName || '-',
       email: customer.email || 'customer@example.com',
       phone: customer.phone || '0771234567',
       address: customer.address || 'Colombo',
@@ -175,7 +175,7 @@ router.post('/create-payhere-checkout', async (req, res) => {
         order: computedOrder,
         customer: {
           firstName: customer.firstName || 'Vivid',
-          lastName: customer.lastName || 'Arts Customer',
+          lastName: customer.lastName || null,
           email: customer.email || null,
           phone: customer.phone || null,
           address: customer.address || null,

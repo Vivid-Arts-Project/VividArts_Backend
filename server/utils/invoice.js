@@ -63,12 +63,14 @@ async function renderInvoice(doc, payment) {
   doc.font('Helvetica-Bold').fontSize(11).fillColor('#1a1a2e').text('Bill To', 50, y);
   y += 16;
   doc.font('Helvetica').fontSize(10).fillColor('#374151');
-  const billName = [customer.firstName, customer.lastName].filter(Boolean).join(' ') || 'N/A';
+  const lastName = String(customer.lastName || '').trim();
+  const billName = [customer.firstName, lastName === 'Arts Customer' ? '' : lastName]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)
+    .join(' ') || 'N/A';
   doc.text(billName, 50, y); y += 14;
   if (customer.email) { doc.text(customer.email, 50, y); y += 14; }
   if (customer.phone) { doc.text(customer.phone, 50, y); y += 14; }
-  const addressLine = [customer.address, customer.city, customer.country].filter(Boolean).join(', ');
-  if (addressLine) { doc.text(addressLine, 50, y); y += 14; }
 
   // Payment info (right column)
   let infoY = 130;
@@ -132,9 +134,10 @@ async function ensureInvoiceGenerated(payment) {
   fs.mkdirSync(INVOICES_DIR, { recursive: true });
   const filePath = invoicePath(payment.payhereOrderId);
   const logoUpdatedAt = fs.existsSync(LOGO_PATH) ? fs.statSync(LOGO_PATH).mtimeMs : 0;
+  const templateUpdatedAt = fs.statSync(__filename).mtimeMs;
   const invoiceUpdatedAt = fs.existsSync(filePath) ? fs.statSync(filePath).mtimeMs : 0;
 
-  if (!fs.existsSync(filePath) || invoiceUpdatedAt < logoUpdatedAt) {
+  if (!fs.existsSync(filePath) || invoiceUpdatedAt < Math.max(logoUpdatedAt, templateUpdatedAt)) {
     const buffer = await generateInvoiceBuffer(payment);
     fs.writeFileSync(filePath, buffer);
   }
