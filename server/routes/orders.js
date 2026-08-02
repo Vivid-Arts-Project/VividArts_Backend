@@ -6,7 +6,7 @@ const { protect } = require('../middleware/authMiddleware');
 // 1. For the customer to receive their notifications in real-time (GET /api/orders/notifications)
 router.get('/notifications', protect, async (req, res) => {
   try {
-    const customerId = req.user.id || req.user.customer_id;
+    const customerId = req.user.customerId;
 
     const notifications = await Notification.findAll({
       where: { customerId: customerId },

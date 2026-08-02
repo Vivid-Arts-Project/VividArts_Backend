@@ -77,7 +77,7 @@ router.post('/create-order', async (req, res) => {
     const computedOrder = calculateOrder(order);
 
     const orderData = {
-      orderId: createOrderId(),
+      payhereOrderId: createOrderId(),
       amount: computedOrder.dueAmount,
       currency: currency || 'LKR',
       paymentMethod: paymentMethod || 'card',
@@ -94,7 +94,7 @@ router.post('/create-order', async (req, res) => {
       success: true,
       payment: {
         id: payment.paymentId,
-        orderId: payment.orderId,
+        orderId: payment.payhereOrderId,
         amount: payment.amount,
         currency: payment.currency,
         status: payment.status
@@ -133,7 +133,7 @@ router.post('/create-payhere-checkout', async (req, res) => {
     const gatewayAmount = calculateDisplayAmount(computedOrder.dueAmount, selectedCurrency);
 
     const payment = await Payment.create({
-      orderId: createOrderId(),
+      payhereOrderId: createOrderId(),
       amount: computedOrder.dueAmount,
       currency: selectedCurrency,
       paymentMethod: 'card',
@@ -142,7 +142,7 @@ router.post('/create-payhere-checkout', async (req, res) => {
 
     const hash = createPayhereCheckoutHash({
       merchantId: PAYHERE_MERCHANT_ID,
-      orderId: payment.orderId,
+      orderId: payment.payhereOrderId,
       amount: gatewayAmount,
       currency: selectedCurrency,
       merchantSecret: PAYHERE_MERCHANT_SECRET
@@ -150,10 +150,10 @@ router.post('/create-payhere-checkout', async (req, res) => {
 
     const checkoutFields = {
       merchant_id: PAYHERE_MERCHANT_ID,
-      return_url: `${FRONTEND_URL}/commission/payment?payment=success&order_id=${payment.orderId}`,
-      cancel_url: `${FRONTEND_URL}/commission/payment?payment=cancelled&order_id=${payment.orderId}`,
+      return_url: `${FRONTEND_URL}/commission/payment?payment=success&order_id=${payment.payhereOrderId}`,
+      cancel_url: `${FRONTEND_URL}/commission/payment?payment=cancelled&order_id=${payment.payhereOrderId}`,
       notify_url: `${BACKEND_URL}/api/payments/payhere-notify`,
-      order_id: payment.orderId,
+      order_id: payment.payhereOrderId,
       items: 'Vivid Arts portrait deposit',
       currency: selectedCurrency,
       amount: gatewayAmount,
@@ -189,7 +189,7 @@ router.post('/create-payhere-checkout', async (req, res) => {
       success: true,
       checkoutUrl: PAYHERE_CHECKOUT_URL,
       checkoutFields,
-      orderId: payment.orderId
+      orderId: payment.payhereOrderId
     });
   } catch (error) {
     console.error('Error creating PayHere checkout:', error);
@@ -215,7 +215,7 @@ router.post('/payhere-notify', async (req, res) => {
       status_message
     } = req.body;
 
-    const payment = await Payment.findOne({ where: { orderId: order_id } });
+    const payment = await Payment.findOne({ where: { payhereOrderId: order_id } });
 
     if (!payment) {
       return res.status(404).send('Payment record not found');
@@ -276,7 +276,7 @@ router.post('/process', async (req, res) => {
     const { orderId, paymentMethod, bankDetails } = req.body;
 
     // Find the payment record
-    const payment = await Payment.findOne({ where: { orderId } });
+    const payment = await Payment.findOne({ where: { payhereOrderId: orderId } });
     if (!payment) {
       return res.status(404).json({ 
         success: false, 
@@ -318,7 +318,7 @@ router.post('/process', async (req, res) => {
       success: true,
       payment: {
         id: payment.paymentId,
-        orderId: payment.orderId,
+        orderId: payment.payhereOrderId,
         status: payment.status,
         transactionId: payment.transactionId,
         ...result
@@ -347,21 +347,21 @@ router.get('/prices', (req, res) => {
 // 6. Get Payment Status
 router.get('/status/:orderId', async (req, res) => {
   try {
-    const payment = await Payment.findOne({ 
-      where: { orderId: req.params.orderId } 
+    const payment = await Payment.findOne({
+      where: { payhereOrderId: req.params.orderId }
     });
-    
+
     if (!payment) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Order not found' 
+      return res.status(404).json({
+        success: false,
+        error: 'Order not found'
       });
     }
 
     res.json({
       success: true,
       payment: {
-        orderId: payment.orderId,
+        orderId: payment.payhereOrderId,
         status: payment.status,
         amount: payment.amount,
         currency: payment.currency,
@@ -382,7 +382,7 @@ router.get('/status/:orderId', async (req, res) => {
 // 7. Download invoice PDF (available once payment is completed)
 router.get('/:orderId/invoice', async (req, res) => {
   try {
-    const payment = await Payment.findOne({ where: { orderId: req.params.orderId } });
+    const payment = await Payment.findOne({ where: { payhereOrderId: req.params.orderId } });
 
     if (!payment) {
       return res.status(404).json({
@@ -399,7 +399,7 @@ router.get('/:orderId/invoice', async (req, res) => {
     }
 
     const filePath = await ensureInvoiceGenerated(payment);
-    res.download(filePath, `invoice-${payment.orderId}.pdf`);
+    res.download(filePath, `invoice-${payment.payhereOrderId}.pdf`);
   } catch (error) {
     console.error('Error generating invoice:', error);
     res.status(500).json({

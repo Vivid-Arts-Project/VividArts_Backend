@@ -36,6 +36,7 @@ const paymentRouter   = require('./routes/Payment');
 const adminAuthRouter = require('./routes/adminAuth');  // login, register, /me
 const adminRouter     = require('./routes/admin');       // orders, proofs, pricing
 const ordersRouter = require('./routes/orders');
+const { ensureCustomerProfileColumns } = require('./utils/schema');
 
 app.use('/api/customers', customerRouter);
 app.use('/api/payments',  paymentRouter);
@@ -46,8 +47,8 @@ app.use('/api/orders', ordersRouter);
 // ── 6. Sync DB and start ──────────────────────────────────────────────────────
 // Create any missing tables once on startup without resetting existing data.
 db.sequelize.authenticate()
-  
-  .then(() => {
+  .then(async () => {
+    await ensureCustomerProfileColumns(db.sequelize);
     app.listen(3001, () => console.log('✓ Server running on http://localhost:3001'));
   })
   .catch(err => console.error('✗ DB connection failed:', err));
