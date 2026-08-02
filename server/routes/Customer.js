@@ -43,6 +43,7 @@ router.post('/', async (req, res) => {
   res.json(customer);
 });
 
+// 📧 1. SEND OTP TO EMAIL ROUTE
 router.post('/register/send-otp', async (req, res) => {
   try {
     const username = String(req.body.username || '').trim();
@@ -92,6 +93,7 @@ router.post('/register/send-otp', async (req, res) => {
   }
 });
 
+// 🔑 2. VERIFY OTP CODE ROUTE
 router.post('/register/verify-otp', (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
   const code = String(req.body.code || '').trim();
@@ -120,6 +122,7 @@ router.post('/register/verify-otp', (req, res) => {
   res.json({ message: 'Email verified successfully.', verificationToken });
 });
 
+// ✅ 3. COMPLETE REGISTER ROUTE
 router.post('/register', async (req, res) => {
   try {
     const { username, email, password, confirmPassword, verificationToken } = req.body;
@@ -148,13 +151,9 @@ router.post('/register', async (req, res) => {
       return res.status(403).json({ message: 'Please verify your email address before creating an account.' });
     }
 
-    // Four rounds keep this classroom/local project responsive while passwords
-    // are still stored as bcrypt hashes rather than plain text.
     const HASH_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS, 10) || 4;
     const hashedPassword = await bcrypt.hash(password, HASH_ROUNDS);
 
-    // The database's unique username/email rules detect duplicate accounts.
-    // Creating directly avoids an extra database lookup before every register.
     const newCustomer = await Customer.create({
       username: normalizedUsername,
       email: normalizedEmail,
@@ -181,6 +180,7 @@ router.post('/register', async (req, res) => {
   }
 });
 
+// 🔓 4. LOGIN ROUTE
 router.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -190,7 +190,6 @@ router.post('/login', async (req, res) => {
     }
 
     const identifier = username.trim();
-    // Allow login by username or email. Emails are stored in lower case.
     const customer = await Customer.findOne({
       where: { [Op.or]: [{ username: identifier }, { email: identifier.toLowerCase() }] },
     });
@@ -219,6 +218,7 @@ router.post('/login', async (req, res) => {
   }
 });
 
+// 👤 PROFILE ROUTES
 router.get('/profile', async (req, res) => {
   try {
     const authHeader = req.headers.authorization || '';
@@ -254,7 +254,6 @@ router.get('/profile', async (req, res) => {
   }
 });
 
-// POST /profile/avatar — upload or replace profile (avatar) image
 router.post('/profile/avatar', async (req, res) => {
   try {
     const authHeader = req.headers.authorization || '';
@@ -264,7 +263,6 @@ router.post('/profile/avatar', async (req, res) => {
     const decoded = decodeToken(token);
     if (!decoded || !decoded.customerId) return res.status(401).json({ message: 'Invalid authentication token.' });
 
-    // Make the decoded id available to multer/cloudinary storage public_id generator
     req.decodedCustomerId = decoded.customerId;
 
     uploadProfile(req, res, async (err) => {
@@ -280,7 +278,6 @@ router.post('/profile/avatar', async (req, res) => {
       customer.profile_image_public_id = req.file.filename;
       await customer.save();
 
-      // attempt to delete previous image (best-effort)
       try { if (previousPublicId && previousPublicId !== req.file.filename) await deleteImage(previousPublicId); } catch (e) { /* ignore */ }
 
       res.json({ message: 'Profile image updated.', profile_image_url: customer.profile_image_url });
@@ -290,7 +287,6 @@ router.post('/profile/avatar', async (req, res) => {
   }
 });
 
-// POST /profile/cover — upload or replace cover image
 router.post('/profile/cover', async (req, res) => {
   try {
     const authHeader = req.headers.authorization || '';
@@ -363,11 +359,7 @@ router.put('/profile', async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════════════════
-// NOTIFICATIONS APIS (අලුතින් එකතු කළ කොටස)
-// ════════════════════════════════════════════════════════════════════════════
-
-// GET /notifications — Customer ගේ Notifications ලබා ගැනීම
+// 🔔 NOTIFICATIONS APIS
 router.get('/notifications', async (req, res) => {
   try {
     const authHeader = req.headers.authorization || '';
@@ -382,8 +374,10 @@ router.get('/notifications', async (req, res) => {
       return res.status(401).json({ message: 'Invalid authentication token.' });
     }
 
-    // Receiving the latest notifications related to the Customer ID
-    const notifications = await Notification.find({ customerId: decoded.customerId }).sort({ createdAt: -1 });
+    const notifications = await Notification.findAll({
+      where: { customerId: decoded.customerId },
+      order: [['createdAt', 'DESC']]
+    });
 
     res.json({
       success: true,
@@ -394,7 +388,6 @@ router.get('/notifications', async (req, res) => {
   }
 });
 
-// PUT /notifications/:id/read — Notification එක Read කළ බව Mark කිරීම
 router.put('/notifications/:id/read', async (req, res) => {
   try {
     const authHeader = req.headers.authorization || '';
@@ -409,7 +402,7 @@ router.put('/notifications/:id/read', async (req, res) => {
       return res.status(401).json({ message: 'Invalid authentication token.' });
     }
 
-    await Notification.findByIdAndUpdate(req.params.id, { isRead: true });
+    await Notification.update({ isRead: true }, { where: { id: req.params.id } });
 
     res.json({ success: true, message: 'Notification marked as read.' });
   } catch (error) {
