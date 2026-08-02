@@ -3,7 +3,7 @@ const crypto = require('crypto');
 const router = express.Router();
 const { Payment } = require('../models');
 const { ensureInvoiceGenerated } = require('../utils/invoice');
-const { SIZES, FRAMES, EXTRA_PERSON_PRICE, calculateOrder } = require('../utils/pricing');
+const { getCatalog, calculateOrder } = require('../utils/pricing');
 
 // Currency rates
 const CURRENCIES = {
@@ -74,7 +74,7 @@ const mapPayhereStatus = (statusCode) => {
 router.post('/create-order', async (req, res) => {
   try {
     const { currency, paymentMethod, bankDetails, order } = req.body;
-    const computedOrder = calculateOrder(order);
+    const computedOrder = await calculateOrder(order);
 
     const orderData = {
       payhereOrderId: createOrderId(),
@@ -129,7 +129,7 @@ router.post('/create-payhere-checkout', async (req, res) => {
       });
     }
 
-    const computedOrder = calculateOrder(order);
+    const computedOrder = await calculateOrder(order);
     const gatewayAmount = calculateDisplayAmount(computedOrder.dueAmount, selectedCurrency);
 
     const payment = await Payment.create({
@@ -377,14 +377,14 @@ router.post('/process', async (req, res) => {
 });
 
 // 5. Get Prices (must be before /:orderId to avoid route conflicts)
-router.get('/prices', (req, res) => {
-  res.json({
-    success: true,
-    sizes: SIZES,
-    frames: FRAMES,
-    extraPersonPrice: EXTRA_PERSON_PRICE,
-    currencies: CURRENCIES
-  });
+router.get('/prices', async (req, res) => {
+  try {
+    const catalog = await getCatalog();
+    res.json({ success: true, ...catalog, currencies: CURRENCIES });
+  } catch (error) {
+    console.error('Error fetching prices:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch prices' });
+  }
 });
 
 // 6. Get Payment Status

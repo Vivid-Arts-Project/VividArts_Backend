@@ -40,7 +40,7 @@ async function renderInvoice(doc, payment) {
   const metadata = payment.metadata || {};
   const customer = metadata.customer || {};
   // Older payments created before order-aware pricing fall back to the default catalog order.
-  const order = metadata.order || calculateOrder({});
+  const order = metadata.order || await calculateOrder({});
   const total = order.total;
   const dueAmount = Number(payment.amount);
   const balanceDue = Math.max(total - dueAmount, 0);
@@ -92,7 +92,8 @@ async function renderInvoice(doc, payment) {
     [`Base price (${order.sizeLabel} portrait)`, money(order.basePrice, payment.currency)],
     ...(order.framePrice > 0 ? [[`${order.frameLabel} frame`, money(order.framePrice, payment.currency)]] : []),
     ...(order.peoplePrice > 0 ? [[`Extra subjects (${order.people - 1})`, money(order.peoplePrice, payment.currency)]] : []),
-    ['Delivery', 'Courier'],
+    ...(order.deliveryPrice > 0 ? [['Delivery', money(order.deliveryPrice, payment.currency)]] : []),
+    ...(order.urgentPrice > 0 ? [['Urgent order', money(order.urgentPrice, payment.currency)]] : []),
   ];
 
   let rowY = tableTop + 26;

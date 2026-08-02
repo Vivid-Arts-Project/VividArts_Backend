@@ -37,6 +37,7 @@ const adminAuthRouter = require('./routes/adminAuth');  // login, register, /me
 const adminRouter     = require('./routes/admin');       // orders, proofs, pricing
 const ordersRouter = require('./routes/orders');
 const { ensureCustomerProfileColumns } = require('./utils/schema');
+const { ensurePriceCatalog } = require('./utils/pricing');
 
 app.use('/api/customers', customerRouter);
 app.use('/api/payments',  paymentRouter);
@@ -49,6 +50,7 @@ app.use('/api/orders', ordersRouter);
 db.sequelize.authenticate()
   .then(async () => {
     await ensureCustomerProfileColumns(db.sequelize);
+    await ensurePriceCatalog();
     app.listen(3001, () => console.log('✓ Server running on http://localhost:3001'));
   })
   .catch(err => console.error('✗ DB connection failed:', err));
