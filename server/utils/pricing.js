@@ -62,18 +62,22 @@ async function calculateOrder(order = {}) {
   const rawPeople = Number(order.people);
   const people = Number.isFinite(rawPeople) && rawPeople >= 1 ? Math.min(Math.floor(rawPeople), 10) : 1;
   const urgent = order.urgent === true || order.isUrgent === true;
+  const urgentDeadline = urgent && /^\d{4}-\d{2}-\d{2}$/.test(order.urgentDeadline || '')
+    ? order.urgentDeadline
+    : null;
+  const deliveryMethod = order.deliveryMethod === 'pickup' ? 'pickup' : 'courier';
   const size = catalog.sizes[sizeId];
   const frame = catalog.frames[frameId];
   const basePrice = size.price;
   const extraPersonPrice = size.extraPersonPrice;
   const framePrice = frame.prices[sizeId];
   const peoplePrice = (people - 1) * extraPersonPrice;
-  const deliveryPrice = catalog.deliveryPrice;
+  const deliveryPrice = deliveryMethod === 'courier' ? catalog.deliveryPrice : 0;
   const urgentPrice = urgent ? catalog.urgentPrice : 0;
   const total = basePrice + framePrice + peoplePrice + deliveryPrice + urgentPrice;
 
   return {
-    sizeId, sizeLabel: size.label, frameId, frameLabel: frame.label, people, urgent,
+    sizeId, sizeLabel: size.label, frameId, frameLabel: frame.label, people, deliveryMethod, urgent, urgentDeadline,
     basePrice, extraPersonPrice, framePrice, peoplePrice, deliveryPrice, urgentPrice,
     total, dueAmount: Math.round(total * 0.5),
     notes: typeof order.notes === 'string' ? order.notes.slice(0, 500) : '',
