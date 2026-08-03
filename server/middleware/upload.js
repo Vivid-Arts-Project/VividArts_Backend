@@ -67,6 +67,16 @@ const coverStorage = new CloudinaryStorage({
   }),
 });
 
+const galleryStorage = new CloudinaryStorage({
+  cloudinary,
+  params: (req) => ({
+    folder: 'art-studio/gallery',
+    public_id: `gallery_${Date.now()}`,
+    allowed_formats: ['jpg', 'jpeg', 'png', 'webp'],
+    transformation: [{ quality: 'auto', fetch_format: 'auto' }],
+  }),
+});
+
 // ─── Multer instances ────────────────────────────────────────────────────────
 // multer-storage-cloudinary streams files directly to Cloudinary.
 // req.file.path  → the full Cloudinary HTTPS URL  (use this to save in DB)
@@ -96,6 +106,12 @@ const uploadCover = multer({
   limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
 }).single('coverImage');
 
+const uploadGallery = multer({
+  storage: galleryStorage,
+  fileFilter: imageFilter,
+  limits: { fileSize: 10 * 1024 * 1024 },
+}).single('image');
+
 // ─── Helper: delete an image from Cloudinary by its public_id ───────────────
 // Use this if you ever need to replace or remove a stored image.
 // public_id is stored in req.file.filename after upload.
@@ -104,4 +120,4 @@ const deleteImage = async (publicId) => {
   await cloudinary.uploader.destroy(publicId);
 };
 
-module.exports = { uploadProof, uploadReferences, uploadProfile, uploadCover, deleteImage, cloudinary };
+module.exports = { uploadProof, uploadReferences, uploadProfile, uploadCover, uploadGallery, deleteImage, cloudinary };

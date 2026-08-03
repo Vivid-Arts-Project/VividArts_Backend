@@ -1,7 +1,9 @@
 const express = require('express');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const router = express.Router();
-const { Payment } = require('../models');
+const db = require('../models');
+const { Payment } = db;
 const { ensureInvoiceGenerated } = require('../utils/invoice');
 const { getCatalog, calculateOrder } = require('../utils/pricing');
 
@@ -26,6 +28,29 @@ const PAYHERE_ALLOWED_CURRENCIES = (process.env.PAYHERE_ALLOWED_CURRENCIES || 'L
   .filter(Boolean);
 
 const createOrderId = () => `ORD-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+
+const customerIdFromRequest = (req) => {
+  try { return jwt.verify((req.headers.authorization || '').replace(/^Bearer\s+/i, ''), process.env.JWT_SECRET || 'dev-secret').customerId; }
+  catch { return null; }
+};
+
+const createCommission = async (req, computedOrder, payment) => {
+  const customerId = customerIdFromRequest(req);
+  if (!customerId) throw new Error('Please sign in again before placing your order');
+  return db.sequelize.transaction(async transaction => {
+    const product = await db.ProductOption.create({
+      paper_size: computedOrder.sizeId, num_subjects: computedOrder.people,
+      frame_type: computedOrder.frameId === 'none' ? 'without_frame' : computedOrder.frameId === 'premium' ? 'wooden_frame' : 'plastic_frame',
+      pickup_option: computedOrder.deliveryMethod, is_urgent: computedOrder.urgent,
+      urgent_deadline: computedOrder.urgentDeadline, customer_note: computedOrder.notes,
+    }, { transaction });
+    const order = await db.Order.create({ customer_id: customerId, product_id: product.product_id,
+      calculated_price: computedOrder.total, payment_type: 'advance', amount_paid: 0,
+      status: 'in_queue', is_urgent: computedOrder.urgent }, { transaction });
+    await payment.update({ order_id: order.order_id }, { transaction });
+    return order;
+  });
+};
 
 const isPlaceholderValue = (value) => !value || String(value).trim().toLowerCase().startsWith('your');
 
@@ -89,12 +114,14 @@ router.post('/create-order', async (req, res) => {
     };
 
     const payment = await Payment.create(orderData);
+    const commission = await createCommission(req, computedOrder, payment);
 
     res.status(201).json({
       success: true,
       payment: {
         id: payment.paymentId,
         orderId: payment.payhereOrderId,
+        commissionId: commission.order_id,
         amount: payment.amount,
         currency: payment.currency,
         status: payment.status
@@ -139,6 +166,7 @@ router.post('/create-payhere-checkout', async (req, res) => {
       paymentMethod: 'card',
       status: 'pending'
     });
+    const commission = await createCommission(req, computedOrder, payment);
 
     const hash = createPayhereCheckoutHash({
       merchantId: PAYHERE_MERCHANT_ID,
@@ -190,6 +218,7 @@ router.post('/create-payhere-checkout', async (req, res) => {
       checkoutUrl: PAYHERE_CHECKOUT_URL,
       checkoutFields,
       orderId: payment.payhereOrderId
+      , commissionId: commission.order_id
     });
   } catch (error) {
     console.error('Error creating PayHere checkout:', error);

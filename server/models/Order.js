@@ -49,7 +49,7 @@ module.exports = (sequelize, DataTypes) => {
       defaultValue: 0.00,
     },
 
-   /* // ── Order status ──────────────────────────────────────────────────────────
+    // ── Order status ──────────────────────────────────────────────────────────
     // Full lifecycle from queue to done
     status: {
       type: DataTypes.ENUM(
@@ -64,7 +64,7 @@ module.exports = (sequelize, DataTypes) => {
         'done'                  // customer received, order complete
       ),
       defaultValue: 'in_queue',
-    },*/
+    },
 
     // ── Urgent order ──────────────────────────────────────────────────────────
     is_urgent: {

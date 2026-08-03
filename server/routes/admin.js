@@ -9,6 +9,20 @@ const { calculatePrice, loadPrices }                = require('../middleware/pri
 // 💡 Importing the Notification Helper
 const { createNotification } = require('../utils/notificationHelper');
 
+const orderJson = (instance) => {
+  const o = instance.toJSON(); const p = o.productOption || {};
+  return { ...o, id: o.order_id, customerId: o.customer_id, totalPrice: o.calculated_price,
+    amountPaid: o.amount_paid, paymentType: o.payment_type, isUrgent: o.is_urgent,
+    artistLocation: o.artist_location, paperSize: p.paper_size,
+    subjectCount: p.num_subjects ? `${p.num_subjects}_subjects` : null,
+    frameType: p.frame_type, pickupOption: p.pickup_option, urgentDeadline: p.urgent_deadline,
+    customerNote: p.customer_note,
+    referencePhotos: (o.referencePhotos || []).map(photo => photo.cloudinary_url),
+    proofImagePath: o.proofImages?.find(proof => proof.is_current)?.cloudinary_url || null,
+    messages: (o.messages || []).map(m => ({ ...m, senderType: m.sender_type, message: m.message_text })),
+  };
+};
+
 // ─── Auth middleware ─────────────────────────────────────────────────────────
 const requireAdmin = (req, res, next) => {
   if (!req.session?.adminId) return res.status(401).json({ error: 'Unauthorized' });
@@ -181,8 +195,8 @@ router.post('/pricing/calculate', async (req, res) => {
 router.get('/orders', requireAdmin, async (req, res) => {
   try {
     const orders = await db.Order.findAll({
-      include: [{ model: db.Customer, as: 'customer', attributes: ['fullName', 'email', 'phone'] }],
-      order: [['isUrgent', 'DESC'], ['createdAt', 'ASC']],
+      include: [{ model: db.Customer, as: 'customer' }, { model: db.ProductOption, as: 'productOption' }, { model: db.ProofImage, as: 'proofImages' }],
+      order: [['is_urgent', 'DESC'], ['createdAt', 'ASC']],
     });
     const stats = {
       total:           orders.length,
@@ -191,7 +205,7 @@ router.get('/orders', requireAdmin, async (req, res) => {
       urgentActive:    orders.filter(o => o.isUrgent && !['finished','done'].includes(o.status)).length,
       waitingFeedback: orders.filter(o => o.status === 'waiting_for_feedback').length,
     };
-    res.json({ orders, stats });
+    res.json({ orders: orders.map(orderJson), stats });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -201,10 +215,13 @@ router.get('/orders/:id', requireAdmin, async (req, res) => {
       include: [
         { model: db.Customer, as: 'customer' },
         { model: db.Message,  as: 'messages', order: [['createdAt', 'ASC']] },
+        { model: db.ProductOption, as: 'productOption' },
+        { model: db.ReferencePhoto, as: 'referencePhotos' },
+        { model: db.ProofImage, as: 'proofImages' },
       ],
     });
     if (!order) return res.status(404).json({ error: 'Order not found' });
-    res.json(order);
+    res.json(orderJson(order));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -212,7 +229,7 @@ router.get('/orders/:id', requireAdmin, async (req, res) => {
 router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
   try {
     const { status, customMessage } = req.body;
-    const valid = ['in_queue','sketching','waiting_for_feedback','finished','framed','shipped','done'];
+    const valid = ['in_queue','sketching','waiting_for_feedback','revision_requested','approved','finished','framed','shipped','done'];
     if (!valid.includes(status)) return res.status(400).json({ error: 'Invalid status' });
 
     const order = await db.Order.findByPk(req.params.id, {
@@ -225,7 +242,7 @@ router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
     if (status === 'shipped' && order.pickupOption === 'pickup') {
       const admin = await db.Admin.findByPk(req.session.adminId);
       const location = order.artistLocation || admin?.businessAddress || process.env.STUDIO_LOCATION || 'Contact admin for pickup address';
-      await db.Message.create({ orderId: order.id, senderType: 'system', message: `📍 Your order is ready for pickup! Location: ${location}` });
+      await db.Message.create({ order_id: order.order_id, sender_type: 'system', message_text: `Your order is ready for pickup. Location: ${location}` });
     }
 
     // Email යැවීම
@@ -253,7 +270,7 @@ router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
     }
 
     // Database එකේ Notification එක Save කිරීම
-    await createNotification(order.customerId, order.id, title, message, status);
+    await createNotification(order.customer_id, order.order_id, title, message, status);
 
     res.json({ message: 'Status updated and notification created', order });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -268,25 +285,23 @@ router.post('/orders/:id/proof', requireAdmin, (req, res) => {
         include: [{ model: db.Customer, as: 'customer' }],
       });
       if (!order) return res.status(404).json({ error: 'Order not found' });
-      await order.update({
-        proofImagePath:     req.file.path,
-        proofImagePublicId: req.file.filename,
-        proofUploadedAt:    new Date(),
-        status:             'waiting_for_feedback',
-      });
-      await db.Message.create({ orderId: order.id, senderType: 'system', message: 'The artist has uploaded your proof image. Please review and approve or request changes.' });
+      await db.ProofImage.update({ is_current: false }, { where: { order_id: order.order_id } });
+      const version = await db.ProofImage.count({ where: { order_id: order.order_id } }) + 1;
+      const proof = await db.ProofImage.create({ order_id: order.order_id, cloudinary_url: req.file.path, cloudinary_public_id: req.file.filename, version, is_current: true, original_filename: req.file.originalname, file_size_bytes: req.file.size });
+      await order.update({ proof_uploaded_at: new Date(), status: 'waiting_for_feedback' });
+      await db.Message.create({ order_id: order.order_id, sender_type: 'system', message_text: 'The artist has uploaded your proof image. Please review and approve or request changes.' });
       await sendProofReadyEmail(order.customer.email, order.customer.fullName, order.id);
 
       // 💡 Proof එක Upload කළාමත් Customer ට Notification එකක් යනවා
       await createNotification(
-        order.customerId, 
-        order.id, 
+        order.customer_id,
+        order.order_id,
         '🖼️ New Proof Image Uploaded', 
         'The artist has uploaded a proof of your portrait! Please check and give feedback.', 
         'waiting_for_feedback'
       );
 
-      res.json({ message: 'Proof uploaded, customer notified', proofUrl: order.proofImagePath });
+      res.json({ message: 'Proof uploaded, customer notified', proofUrl: proof.cloudinary_url });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 });
@@ -295,7 +310,7 @@ router.post('/orders/:id/messages', requireAdmin, async (req, res) => {
   try {
     const { message } = req.body;
     if (!message?.trim()) return res.status(400).json({ error: 'Message is required' });
-    const msg = await db.Message.create({ orderId: req.params.id, senderType: 'admin', senderId: req.session.adminId, message: message.trim() });
+    const msg = await db.Message.create({ order_id: req.params.id, sender_type: 'admin', sender_id: req.session.adminId, message_text: message.trim() });
     res.status(201).json(msg);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -305,7 +320,7 @@ router.patch('/orders/:id/location', requireAdmin, async (req, res) => {
     const { artistLocation } = req.body;
     const order = await db.Order.findByPk(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
-    await order.update({ artistLocation });
+    await order.update({ artist_location: artistLocation });
     res.json({ message: 'Location saved' });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
