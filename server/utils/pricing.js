@@ -66,6 +66,9 @@ async function calculateOrder(order = {}) {
     ? order.urgentDeadline
     : null;
   const deliveryMethod = order.deliveryMethod === 'pickup' ? 'pickup' : 'courier';
+  const deliveryAddress = deliveryMethod === 'courier' && typeof order.deliveryAddress === 'string'
+    ? order.deliveryAddress.trim().slice(0, 300)
+    : null;
   const size = catalog.sizes[sizeId];
   const frame = catalog.frames[frameId];
   const basePrice = size.price;
@@ -77,7 +80,7 @@ async function calculateOrder(order = {}) {
   const total = basePrice + framePrice + peoplePrice + deliveryPrice + urgentPrice;
 
   return {
-    sizeId, sizeLabel: size.label, frameId, frameLabel: frame.label, people, deliveryMethod, urgent, urgentDeadline,
+    sizeId, sizeLabel: size.label, frameId, frameLabel: frame.label, people, deliveryMethod, deliveryAddress, urgent, urgentDeadline,
     basePrice, extraPersonPrice, framePrice, peoplePrice, deliveryPrice, urgentPrice,
     total, dueAmount: Math.round(total * 0.5),
     notes: typeof order.notes === 'string' ? order.notes.slice(0, 500) : '',
