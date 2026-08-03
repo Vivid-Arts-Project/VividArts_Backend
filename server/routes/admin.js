@@ -10,9 +10,12 @@ const { calculatePrice, loadPrices }                = require('../middleware/pri
 const { createNotification } = require('../utils/notificationHelper');
 
 const orderJson = (instance) => {
-  const o = instance.toJSON(); const p = o.productOption || {};
+  const o = typeof instance?.toJSON === 'function' ? instance.toJSON() : instance;
+  if (!o) return null;
+  const p = o.productOption || {};
+  const completedPaid = (o.payments || []).filter(payment => payment.status === 'completed').reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
   return { ...o, id: o.order_id, customerId: o.customer_id, totalPrice: o.calculated_price,
-    amountPaid: o.amount_paid, paymentType: o.payment_type, isUrgent: o.is_urgent,
+    amountPaid: completedPaid || Number(o.amount_paid || 0), paymentType: 'advance', isUrgent: o.is_urgent,
     artistLocation: o.artist_location, paperSize: p.paper_size,
     subjectCount: p.num_subjects ? `${p.num_subjects}_subjects` : null,
     frameType: p.frame_type, pickupOption: p.pickup_option, urgentDeadline: p.urgent_deadline,
@@ -20,6 +23,36 @@ const orderJson = (instance) => {
     referencePhotos: (o.referencePhotos || []).map(photo => photo.cloudinary_url),
     proofImagePath: o.proofImages?.find(proof => proof.is_current)?.cloudinary_url || null,
     messages: (o.messages || []).map(m => ({ ...m, senderType: m.sender_type, message: m.message_text })),
+  };
+};
+
+const customerJson = (instance) => {
+  const customer = instance.toJSON();
+  const orders = (customer.orders || []).map(orderJson).filter(Boolean).map(order => ({
+    id: order.id,
+    currency: order.currency,
+    totalPrice: order.totalPrice,
+    amountPaid: order.amountPaid,
+    status: order.status,
+    paperSize: order.paperSize,
+    frameType: order.frameType,
+    pickupOption: order.pickupOption,
+    createdAt: order.createdAt,
+  }));
+  return {
+    id: customer.customer_id,
+    username: customer.username,
+    fullName: customer.full_name || customer.username,
+    email: customer.email,
+    phone: customer.phone_number,
+    address: customer.address,
+    profileImageUrl: customer.profile_image_url,
+    createdAt: customer.createdAt,
+    orders,
+    lastOrderAt: orders.reduce((latest, order) => {
+      const created = order.createdAt ? new Date(order.createdAt).getTime() : 0;
+      return created > latest ? created : latest;
+    }, 0) || null,
   };
 };
 
@@ -195,7 +228,7 @@ router.post('/pricing/calculate', async (req, res) => {
 router.get('/orders', requireAdmin, async (req, res) => {
   try {
     const orders = await db.Order.findAll({
-      include: [{ model: db.Customer, as: 'customer' }, { model: db.ProductOption, as: 'productOption' }, { model: db.ProofImage, as: 'proofImages' }],
+      include: [{ model: db.Customer, as: 'customer' }, { model: db.ProductOption, as: 'productOption' }, { model: db.ProofImage, as: 'proofImages' }, { model: db.Payment, as: 'payments' }],
       order: [['is_urgent', 'DESC'], ['createdAt', 'ASC']],
     });
     const stats = {
@@ -204,8 +237,24 @@ router.get('/orders', requireAdmin, async (req, res) => {
       sketching:       orders.filter(o => o.status === 'sketching').length,
       urgentActive:    orders.filter(o => o.isUrgent && !['finished','done'].includes(o.status)).length,
       waitingFeedback: orders.filter(o => o.status === 'waiting_for_feedback').length,
+      totalValue:      orders.reduce((sum, o) => sum + Number(o.calculated_price || 0), 0),
+      totalCollected:  orders.reduce((sum, o) => sum + Number(o.amount_paid || 0), 0),
     };
     res.json({ orders: orders.map(orderJson), stats });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.get('/customers', requireAdmin, async (req, res) => {
+  try {
+    const customers = await db.Customer.findAll({
+      include: [{
+        model: db.Order,
+        as: 'orders',
+        include: [{ model: db.ProductOption, as: 'productOption' }, { model: db.Payment, as: 'payments' }],
+      }],
+      order: [['createdAt', 'DESC']],
+    });
+    res.json({ customers: customers.map(customerJson) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -229,13 +278,21 @@ router.get('/orders/:id', requireAdmin, async (req, res) => {
 router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
   try {
     const { status, customMessage } = req.body;
-    const valid = ['in_queue','sketching','waiting_for_feedback','revision_requested','approved','finished','framed','shipped','done'];
+    const valid = ['in_queue','sketching','waiting_for_feedback','finished','framed','shipped','done'];
     if (!valid.includes(status)) return res.status(400).json({ error: 'Invalid status' });
 
     const order = await db.Order.findByPk(req.params.id, {
       include: [{ model: db.Customer, as: 'customer' }],
     });
     if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    const product = await order.getProductOption();
+    if (status === 'framed' && (!product?.frame_type || product.frame_type === 'without_frame')) {
+      return res.status(400).json({ error: 'Framed status is only available for framed orders' });
+    }
+    if (status === 'shipped' && product?.pickup_option !== 'courier') {
+      return res.status(400).json({ error: 'Shipped status is only available for courier orders' });
+    }
 
     await order.update({ status });
 

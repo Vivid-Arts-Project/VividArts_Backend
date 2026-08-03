@@ -93,6 +93,17 @@ const mapPayhereStatus = (statusCode) => {
   return 'pending';
 };
 
+const syncLinkedOrderPayment = async (payment) => {
+  if (!payment.order_id) return;
+  const completed = await Payment.sum('amount', {
+    where: { order_id: payment.order_id, status: 'completed' },
+  });
+  await db.Order.update(
+    { amount_paid: Number(completed || 0), payment_type: 'advance' },
+    { where: { order_id: payment.order_id } },
+  );
+};
+
 // ============= ROUTES =============
 
 // 1. Create Payment Order
@@ -213,6 +224,8 @@ router.post('/create-payhere-checkout', async (req, res) => {
       }
     });
 
+    await syncLinkedOrderPayment(payment);
+
     res.status(201).json({
       success: true,
       checkoutUrl: PAYHERE_CHECKOUT_URL,
@@ -286,6 +299,8 @@ router.post('/payhere-notify', async (req, res) => {
       }
     });
 
+    await syncLinkedOrderPayment(payment);
+
     if (payment.status === 'completed') {
       ensureInvoiceGenerated(payment).catch((err) => {
         console.error('Invoice generation failed:', err);
@@ -326,6 +341,8 @@ router.post('/sandbox-confirm-return/:orderId', async (req, res) => {
         },
       });
     }
+
+    await syncLinkedOrderPayment(payment);
 
     await ensureInvoiceGenerated(payment);
     res.json({
@@ -381,6 +398,8 @@ router.post('/process', async (req, res) => {
       bankReference: result.reference || null,
       metadata: result
     });
+
+    await syncLinkedOrderPayment(payment);
 
     ensureInvoiceGenerated(payment).catch((err) => {
       console.error('Invoice generation failed:', err);
@@ -485,6 +504,11 @@ router.get('/:orderId/invoice', async (req, res) => {
 router.get('/', async (req, res) => {
   try {
     const payments = await Payment.findAll({
+      include: [{
+        model: db.Order,
+        as: 'order',
+        include: [{ model: db.Customer, as: 'customer' }],
+      }],
       order: [['createdAt', 'DESC']]
     });
     res.json({ success: true, payments });
