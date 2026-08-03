@@ -1,7 +1,9 @@
 const express = require('express');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const router = express.Router();
-const { Payment } = require('../models');
+const db = require('../models');
+const { Payment } = db;
 const { ensureInvoiceGenerated } = require('../utils/invoice');
 const { getCatalog, calculateOrder } = require('../utils/pricing');
 
@@ -26,6 +28,29 @@ const PAYHERE_ALLOWED_CURRENCIES = (process.env.PAYHERE_ALLOWED_CURRENCIES || 'L
   .filter(Boolean);
 
 const createOrderId = () => `ORD-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+
+const customerIdFromRequest = (req) => {
+  try { return jwt.verify((req.headers.authorization || '').replace(/^Bearer\s+/i, ''), process.env.JWT_SECRET || 'dev-secret').customerId; }
+  catch { return null; }
+};
+
+const createCommission = async (req, computedOrder, payment) => {
+  const customerId = customerIdFromRequest(req);
+  if (!customerId) throw new Error('Please sign in again before placing your order');
+  return db.sequelize.transaction(async transaction => {
+    const product = await db.ProductOption.create({
+      paper_size: computedOrder.sizeId, num_subjects: computedOrder.people,
+      frame_type: computedOrder.frameId === 'none' ? 'without_frame' : computedOrder.frameId === 'premium' ? 'wooden_frame' : 'plastic_frame',
+      pickup_option: computedOrder.deliveryMethod, is_urgent: computedOrder.urgent,
+      urgent_deadline: computedOrder.urgentDeadline, customer_note: computedOrder.notes,
+    }, { transaction });
+    const order = await db.Order.create({ customer_id: customerId, product_id: product.product_id,
+      calculated_price: computedOrder.total, payment_type: 'advance', amount_paid: 0,
+      status: 'in_queue', is_urgent: computedOrder.urgent }, { transaction });
+    await payment.update({ order_id: order.order_id }, { transaction });
+    return order;
+  });
+};
 
 const isPlaceholderValue = (value) => !value || String(value).trim().toLowerCase().startsWith('your');
 
@@ -68,6 +93,17 @@ const mapPayhereStatus = (statusCode) => {
   return 'pending';
 };
 
+const syncLinkedOrderPayment = async (payment) => {
+  if (!payment.order_id) return;
+  const completed = await Payment.sum('amount', {
+    where: { order_id: payment.order_id, status: 'completed' },
+  });
+  await db.Order.update(
+    { amount_paid: Number(completed || 0), payment_type: 'advance' },
+    { where: { order_id: payment.order_id } },
+  );
+};
+
 // ============= ROUTES =============
 
 // 1. Create Payment Order
@@ -89,12 +125,14 @@ router.post('/create-order', async (req, res) => {
     };
 
     const payment = await Payment.create(orderData);
+    const commission = await createCommission(req, computedOrder, payment);
 
     res.status(201).json({
       success: true,
       payment: {
         id: payment.paymentId,
         orderId: payment.payhereOrderId,
+        commissionId: commission.order_id,
         amount: payment.amount,
         currency: payment.currency,
         status: payment.status
@@ -139,6 +177,7 @@ router.post('/create-payhere-checkout', async (req, res) => {
       paymentMethod: 'card',
       status: 'pending'
     });
+    const commission = await createCommission(req, computedOrder, payment);
 
     const hash = createPayhereCheckoutHash({
       merchantId: PAYHERE_MERCHANT_ID,
@@ -185,11 +224,14 @@ router.post('/create-payhere-checkout', async (req, res) => {
       }
     });
 
+    await syncLinkedOrderPayment(payment);
+
     res.status(201).json({
       success: true,
       checkoutUrl: PAYHERE_CHECKOUT_URL,
       checkoutFields,
       orderId: payment.payhereOrderId
+      , commissionId: commission.order_id
     });
   } catch (error) {
     console.error('Error creating PayHere checkout:', error);
@@ -257,6 +299,8 @@ router.post('/payhere-notify', async (req, res) => {
       }
     });
 
+    await syncLinkedOrderPayment(payment);
+
     if (payment.status === 'completed') {
       ensureInvoiceGenerated(payment).catch((err) => {
         console.error('Invoice generation failed:', err);
@@ -297,6 +341,8 @@ router.post('/sandbox-confirm-return/:orderId', async (req, res) => {
         },
       });
     }
+
+    await syncLinkedOrderPayment(payment);
 
     await ensureInvoiceGenerated(payment);
     res.json({
@@ -352,6 +398,8 @@ router.post('/process', async (req, res) => {
       bankReference: result.reference || null,
       metadata: result
     });
+
+    await syncLinkedOrderPayment(payment);
 
     ensureInvoiceGenerated(payment).catch((err) => {
       console.error('Invoice generation failed:', err);
@@ -456,6 +504,11 @@ router.get('/:orderId/invoice', async (req, res) => {
 router.get('/', async (req, res) => {
   try {
     const payments = await Payment.findAll({
+      include: [{
+        model: db.Order,
+        as: 'order',
+        include: [{ model: db.Customer, as: 'customer' }],
+      }],
       order: [['createdAt', 'DESC']]
     });
     res.json({ success: true, payments });

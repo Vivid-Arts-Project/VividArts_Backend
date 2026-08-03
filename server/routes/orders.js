@@ -1,7 +1,45 @@
 const express = require('express');
 const router = express.Router();
-const { Notification } = require('../models');
+const db = require('../models');
+const { Notification } = db;
 const { protect } = require('../middleware/authMiddleware');
+
+router.get('/my-orders', protect, async (req, res) => {
+  try {
+    const orders = await db.Order.findAll({ where: { customer_id: req.user.customerId },
+      include: [{ model: db.ProductOption, as: 'productOption' }, { model: db.ProofImage, as: 'proofImages' }, { model: db.Message, as: 'messages' }],
+      order: [['createdAt', 'DESC']] });
+    res.json(orders.map(instance => { const o = instance.toJSON(); return { ...o, id: o.order_id,
+      totalPrice: o.calculated_price, amountPaid: o.amount_paid, isUrgent: o.is_urgent,
+      paperSize: o.productOption?.paper_size, pickupOption: o.productOption?.pickup_option,
+      proofImagePath: o.proofImages?.find(p => p.is_current)?.cloudinary_url || null,
+      messages: (o.messages || []).map(m => ({ ...m, senderType: m.sender_type, message: m.message_text })) }; }));
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+router.post('/:id/messages', protect, async (req, res) => {
+  try {
+    const order = await db.Order.findOne({ where: { order_id: req.params.id, customer_id: req.user.customerId } });
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (!req.body.message?.trim()) return res.status(400).json({ error: 'Message is required' });
+    res.status(201).json(await db.Message.create({ order_id: order.order_id, sender_type: 'customer', sender_id: String(req.user.customerId), message_text: req.body.message.trim() }));
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+router.post('/:id/proof-review', protect, async (req, res) => {
+  try {
+    const order = await db.Order.findOne({ where: { order_id: req.params.id, customer_id: req.user.customerId }, include: [{ model: db.ProofImage, as: 'proofImages' }] });
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    const proof = order.proofImages.find(p => p.is_current);
+    if (!proof) return res.status(400).json({ error: 'No proof is awaiting review' });
+    const approved = req.body.action === 'approve';
+    if (!approved && !req.body.note?.trim()) return res.status(400).json({ error: 'Please describe the requested changes' });
+    await proof.update({ review_status: approved ? 'approved' : 'revision_requested', revision_note: approved ? null : req.body.note.trim(), reviewed_at: new Date() });
+    await order.update({ status: approved ? 'approved' : 'revision_requested', ...(approved ? { approved_at: new Date() } : {}) });
+    await db.Message.create({ order_id: order.order_id, sender_type: 'system', message_text: approved ? 'Customer approved the proof.' : `Customer requested changes: ${req.body.note.trim()}` });
+    res.json({ message: approved ? 'Proof approved' : 'Revision requested', status: order.status });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
 
 // 1. For the customer to receive their notifications in real-time (GET /api/orders/notifications)
 router.get('/notifications', protect, async (req, res) => {

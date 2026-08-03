@@ -21,4 +21,16 @@ async function ensureCustomerProfileColumns(sequelize) {
   }
 }
 
-module.exports = { ensureCustomerProfileColumns };
+async function ensureOrderWorkflowColumns(sequelize) {
+  const queryInterface = sequelize.getQueryInterface();
+  let columns;
+  try { columns = await queryInterface.describeTable('Orders'); }
+  catch { return; }
+  if (!columns.status) {
+    await queryInterface.addColumn('Orders', 'status', {
+      type: DataTypes.STRING(40), allowNull: false, defaultValue: 'in_queue',
+    });
+  }
+}
+
+module.exports = { ensureCustomerProfileColumns, ensureOrderWorkflowColumns };

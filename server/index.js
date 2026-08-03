@@ -36,7 +36,8 @@ const paymentRouter   = require('./routes/Payment');
 const adminAuthRouter = require('./routes/adminAuth');  // login, register, /me
 const adminRouter     = require('./routes/admin');       // orders, proofs, pricing
 const ordersRouter = require('./routes/orders');
-const { ensureCustomerProfileColumns } = require('./utils/schema');
+const contentRouter = require('./routes/content');
+const { ensureCustomerProfileColumns, ensureOrderWorkflowColumns } = require('./utils/schema');
 const { ensurePriceCatalog } = require('./utils/pricing');
 
 app.use('/api/customers', customerRouter);
@@ -44,13 +45,16 @@ app.use('/api/payments',  paymentRouter);
 app.use('/api/admin',     adminAuthRouter); // POST /api/admin/login etc.
 app.use('/api/admin',     adminRouter);     // GET  /api/admin/orders etc.
 app.use('/api/orders', ordersRouter);
+app.use('/api/content', contentRouter);
 
 // ── 6. Sync DB and start ──────────────────────────────────────────────────────
 // Create any missing tables once on startup without resetting existing data.
 db.sequelize.authenticate()
   .then(async () => {
     await ensureCustomerProfileColumns(db.sequelize);
+    await ensureOrderWorkflowColumns(db.sequelize);
     await ensurePriceCatalog();
+    await db.GalleryImage.sync();
     app.listen(3001, () => console.log('✓ Server running on http://localhost:3001'));
   })
   .catch(err => console.error('✗ DB connection failed:', err));
