@@ -1,6 +1,5 @@
 const express  = require('express');
 const router   = express.Router();
-const bcrypt   = require('bcrypt');
 const db       = require('../models');
 const { uploadProof }          = require('../middleware/upload');
 const { sendProofReadyEmail, sendStatusUpdateEmail } = require('../middleware/email');
@@ -63,37 +62,6 @@ const requireAdmin = (req, res, next) => {
 };
 
 // ════════════════════════════════════════════════════════════════════════════
-// AUTH
-// ════════════════════════════════════════════════════════════════════════════
-
-// POST /admin/login
-router.post('/login', async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    const admin = await db.Admin.findOne({ where: { username } });
-    if (!admin || !(await admin.checkPassword(password))) {
-      return res.status(401).json({ error: 'Invalid username or password' });
-    }
-    req.session.adminId = admin.id;
-    res.json({
-      message: 'Logged in',
-      admin: {
-        id: admin.id,
-        firstName: admin.firstName,
-        lastName: admin.lastName,
-        email: admin.email,
-        businessName: admin.businessName,
-      },
-    });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// POST /admin/logout
-router.post('/logout', requireAdmin, (req, res) => {
-  req.session.destroy(() => res.json({ message: 'Logged out' }));
-});
-
-// ════════════════════════════════════════════════════════════════════════════
 // ADMIN PROFILE  (Settings page reads and writes these)
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -108,35 +76,6 @@ router.get('/profile', requireAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// PATCH /admin/profile  — update name, email, phone
-router.patch('/profile', requireAdmin, async (req, res) => {
-  try {
-    const admin = await db.Admin.findByPk(req.session.adminId);
-    if (!admin) return res.status(404).json({ error: 'Admin not found' });
-
-    const { firstName, lastName, email, phone } = req.body;
-    await admin.update({ firstName, lastName, email, phone });
-
-    res.json({
-      message: 'Profile updated',
-      admin: { firstName: admin.firstName, lastName: admin.lastName, email: admin.email, phone: admin.phone },
-    });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// PATCH /admin/business  — update business name, email, address
-router.patch('/business', requireAdmin, async (req, res) => {
-  try {
-    const admin = await db.Admin.findByPk(req.session.adminId);
-    if (!admin) return res.status(404).json({ error: 'Admin not found' });
-
-    const { businessName, businessEmail, businessAddress } = req.body;
-    await admin.update({ businessName, businessEmail, businessAddress });
-
-    res.json({ message: 'Business info updated' });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
 // PATCH /admin/notifications  — toggle email notification preferences
 router.patch('/notifications', requireAdmin, async (req, res) => {
   try {
@@ -148,25 +87,6 @@ router.patch('/notifications', requireAdmin, async (req, res) => {
     await admin.update({ notifPreferences: updated });
 
     res.json({ message: 'Notification preferences saved', notifPreferences: admin.notifPreferences });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// PATCH /admin/password  — change password
-router.patch('/password', requireAdmin, async (req, res) => {
-  try {
-    const admin = await db.Admin.findByPk(req.session.adminId);
-    if (!admin) return res.status(404).json({ error: 'Admin not found' });
-
-    const { currentPassword, newPassword } = req.body;
-    if (!(await admin.checkPassword(currentPassword))) {
-      return res.status(400).json({ error: 'Current password is incorrect' });
-    }
-    if (!newPassword || newPassword.length < 8) {
-      return res.status(400).json({ error: 'New password must be at least 8 characters' });
-    }
-
-    await admin.update({ passwordHash: await db.Admin.hashPassword(newPassword) });
-    res.json({ message: 'Password updated successfully' });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

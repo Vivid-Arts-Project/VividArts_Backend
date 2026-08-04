@@ -32,17 +32,6 @@ const decodeToken = (token) => {
   }
 };
 
-router.get('/', async (req, res) => {
-  const listOfCustomers = await Customer.findAll();
-  res.json(listOfCustomers);
-});
-
-router.post('/', async (req, res) => {
-  const customer = req.body;
-  await Customer.create(customer);
-  res.json(customer);
-});
-
 // 📧 1. SEND OTP TO EMAIL ROUTE
 router.post('/register/send-otp', async (req, res) => {
   try {

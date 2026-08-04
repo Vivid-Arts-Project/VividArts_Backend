@@ -7,6 +7,11 @@ const { Payment } = db;
 const { ensureInvoiceGenerated } = require('../utils/invoice');
 const { getCatalog, calculateOrder } = require('../utils/pricing');
 
+const requireAdmin = (req, res, next) => {
+  if (!req.session?.adminId) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+};
+
 // Currency rates
 const CURRENCIES = {
   LKR: { rate: 1, symbol: 'Rs' },
@@ -501,7 +506,7 @@ router.get('/:orderId/invoice', async (req, res) => {
 });
 
 // 8. Get All Payments (for admin)
-router.get('/', async (req, res) => {
+router.get('/', requireAdmin, async (req, res) => {
   try {
     const payments = await Payment.findAll({
       include: [{
