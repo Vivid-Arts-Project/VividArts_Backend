@@ -6,10 +6,51 @@ const db = require('../models');
 const { Payment } = db;
 const { ensureInvoiceGenerated } = require('../utils/invoice');
 const { getCatalog, calculateOrder } = require('../utils/pricing');
+const { JWT_SECRET } = require('../config/auth');
 
 const requireAdmin = (req, res, next) => {
   if (!req.session?.adminId) return res.status(401).json({ error: 'Unauthorized' });
   next();
+};
+
+const requireCustomer = (req, res, next) => {
+  try {
+    const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (!decoded.customerId) return res.status(401).json({ success: false, error: 'Unauthorized' });
+    req.customerId = decoded.customerId;
+    next();
+  } catch {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+  }
+};
+
+const requirePaymentViewer = (req, res, next) => {
+  if (req.session?.adminId) {
+    req.isAdminViewer = true;
+    return next();
+  }
+  return requireCustomer(req, res, next);
+};
+
+const requireOwnedPayment = async (req, res, next) => {
+  try {
+    const payment = await Payment.findOne({ where: { payhereOrderId: req.params.orderId } });
+    if (!payment) return res.status(404).json({ success: false, error: 'Order not found' });
+    if (req.isAdminViewer) {
+      req.payment = payment;
+      return next();
+    }
+    const order = payment.order_id && await db.Order.findOne({
+      where: { order_id: payment.order_id, customer_id: req.customerId },
+      attributes: ['order_id'],
+    });
+    if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
+    req.payment = payment;
+    next();
+  } catch (error) {
+    next(error);
+  }
 };
 
 // Currency rates
@@ -34,14 +75,8 @@ const PAYHERE_ALLOWED_CURRENCIES = (process.env.PAYHERE_ALLOWED_CURRENCIES || 'L
 
 const createOrderId = () => `ORD-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
-const customerIdFromRequest = (req) => {
-  try { return jwt.verify((req.headers.authorization || '').replace(/^Bearer\s+/i, ''), process.env.JWT_SECRET || 'dev-secret').customerId; }
-  catch { return null; }
-};
-
 const createCommission = async (req, computedOrder, payment) => {
-  const customerId = customerIdFromRequest(req);
-  if (!customerId) throw new Error('Please sign in again before placing your order');
+  const customerId = req.customerId;
   return db.sequelize.transaction(async transaction => {
     const product = await db.ProductOption.create({
       paper_size: computedOrder.sizeId, num_subjects: computedOrder.people,
@@ -111,8 +146,27 @@ const syncLinkedOrderPayment = async (payment) => {
 
 // ============= ROUTES =============
 
+// Current position for the next portrait entering the production queue.
+// Completed (`done`) orders no longer occupy a queue slot.
+router.get('/queue-position', requireCustomer, async (_req, res) => {
+  try {
+    const activeOrders = await db.Order.count({
+      where: { status: { [db.Sequelize.Op.ne]: 'done' } },
+    });
+
+    res.json({
+      success: true,
+      activeOrders,
+      queuePosition: activeOrders + 1,
+    });
+  } catch (error) {
+    console.error('Error fetching queue position:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch queue position' });
+  }
+});
+
 // 1. Create Payment Order
-router.post('/create-order', async (req, res) => {
+router.post('/create-order', requireCustomer, async (req, res) => {
   try {
     const { currency, paymentMethod, bankDetails, order } = req.body;
     const computedOrder = await calculateOrder(order);
@@ -153,7 +207,7 @@ router.post('/create-order', async (req, res) => {
 });
 
 // 2. Create PayHere checkout payload for card payments
-router.post('/create-payhere-checkout', async (req, res) => {
+router.post('/create-payhere-checkout', requireCustomer, async (req, res) => {
   try {
     const configError = validatePayhereConfig();
     if (configError) {
@@ -323,18 +377,13 @@ router.post('/payhere-notify', async (req, res) => {
 // development. The browser return is therefore used only in development
 // sandbox mode so the complete checkout and invoice flow can be tested.
 // Production payments must always be confirmed by /payhere-notify above.
-router.post('/sandbox-confirm-return/:orderId', async (req, res) => {
+router.post('/sandbox-confirm-return/:orderId', requireCustomer, requireOwnedPayment, async (req, res) => {
   try {
     if (process.env.NODE_ENV !== 'development' || process.env.PAYHERE_SANDBOX === 'false') {
       return res.status(404).json({ success: false, error: 'Not found' });
     }
 
-    const payment = await Payment.findOne({
-      where: { payhereOrderId: req.params.orderId },
-    });
-    if (!payment) {
-      return res.status(404).json({ success: false, error: 'Order not found' });
-    }
+    const payment = req.payment;
 
     if (payment.status === 'pending') {
       await payment.update({
@@ -365,7 +414,7 @@ router.post('/sandbox-confirm-return/:orderId', async (req, res) => {
 });
 
 // 4. Process bank transfer payments
-router.post('/process', async (req, res) => {
+router.post('/process', requireCustomer, async (req, res) => {
   try {
     const { orderId, paymentMethod, bankDetails } = req.body;
 
@@ -377,6 +426,12 @@ router.post('/process', async (req, res) => {
         error: 'Order not found' 
       });
     }
+
+    const ownedOrder = payment.order_id && await db.Order.findOne({
+      where: { order_id: payment.order_id, customer_id: req.customerId },
+      attributes: ['order_id'],
+    });
+    if (!ownedOrder) return res.status(404).json({ success: false, error: 'Order not found' });
 
     let result;
 
@@ -441,18 +496,9 @@ router.get('/prices', async (req, res) => {
 });
 
 // 6. Get Payment Status
-router.get('/status/:orderId', async (req, res) => {
+router.get('/status/:orderId', requireCustomer, requireOwnedPayment, async (req, res) => {
   try {
-    const payment = await Payment.findOne({
-      where: { payhereOrderId: req.params.orderId }
-    });
-
-    if (!payment) {
-      return res.status(404).json({
-        success: false,
-        error: 'Order not found'
-      });
-    }
+    const payment = req.payment;
 
     res.json({
       success: true,
@@ -476,16 +522,9 @@ router.get('/status/:orderId', async (req, res) => {
 });
 
 // 7. Download invoice PDF (available once payment is completed)
-router.get('/:orderId/invoice', async (req, res) => {
+router.get('/:orderId/invoice', requirePaymentViewer, requireOwnedPayment, async (req, res) => {
   try {
-    const payment = await Payment.findOne({ where: { payhereOrderId: req.params.orderId } });
-
-    if (!payment) {
-      return res.status(404).json({
-        success: false,
-        error: 'Order not found'
-      });
-    }
+    const payment = req.payment;
 
     if (payment.status !== 'completed') {
       return res.status(409).json({

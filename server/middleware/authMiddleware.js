@@ -1,6 +1,5 @@
 const jwt = require('jsonwebtoken');
-
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
+const { JWT_SECRET } = require('../config/auth');
 
 const protect = (req, res, next) => {
   let token;
