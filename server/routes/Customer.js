@@ -8,11 +8,11 @@ const { Op } = require('sequelize');
 const { sendEmail } = require('../middleware/email');
 
 const { uploadProfile, uploadCover, deleteImage } = require('../middleware/upload');
+const { JWT_SECRET } = require('../config/auth');
 
 // 💡 Importing the Notification Model
 const Notification = require('../models/Notification');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 const OTP_LIFETIME_MS = 10 * 60 * 1000;
 const pendingEmailVerifications = new Map();
 const verifiedEmailTokens = new Map();

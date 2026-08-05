@@ -1,5 +1,4 @@
 const multer = require('multer');
-const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const cloudinary = require('cloudinary').v2;
 
 // ─── Configure Cloudinary from .env ─────────────────────────────────────────
@@ -18,6 +17,44 @@ const imageFilter = (req, file, cb) => {
   if (isAllowed) return cb(null, true);
   cb(new Error('Only image files are allowed (jpg, png, webp)'));
 };
+
+class CloudinaryStorage {
+  constructor({ params }) {
+    this.params = params;
+  }
+
+  _handleFile(req, file, cb) {
+    let settled = false;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      cb(error, result);
+    };
+
+    Promise.resolve(typeof this.params === 'function' ? this.params(req, file) : this.params)
+      .then((params) => {
+        const upload = cloudinary.uploader.upload_stream(
+          { resource_type: 'image', ...params },
+          (error, result) => {
+            if (error) return finish(error);
+            finish(null, {
+              path: result.secure_url,
+              filename: result.public_id,
+              size: result.bytes,
+            });
+          },
+        );
+        file.stream.on('error', finish);
+        file.stream.pipe(upload);
+      })
+      .catch(finish);
+  }
+
+  _removeFile(req, file, cb) {
+    if (!file.filename) return cb(null);
+    cloudinary.uploader.destroy(file.filename).then(() => cb(null)).catch(cb);
+  }
+}
 
 // ─── Proof image storage (artist uploads approval image) ────────────────────
 // Saves to: cloudinary folder "art-studio/proofs"
@@ -39,7 +76,7 @@ const refStorage = new CloudinaryStorage({
   cloudinary,
   params: (req, file) => ({
     folder: 'art-studio/references',
-    public_id: `ref_${Date.now()}_${file.originalname.replace(/\.[^.]+$/, '').replace(/\s+/g, '_')}`,
+    public_id: `ref_${Date.now()}_${file.originalname.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 80)}`,
     allowed_formats: ['jpg', 'jpeg', 'png', 'webp'],
     transformation: [{ quality: 'auto', fetch_format: 'auto' }],
   }),
@@ -78,7 +115,7 @@ const galleryStorage = new CloudinaryStorage({
 });
 
 // ─── Multer instances ────────────────────────────────────────────────────────
-// multer-storage-cloudinary streams files directly to Cloudinary.
+// The local Multer storage engine streams files directly to Cloudinary.
 // req.file.path  → the full Cloudinary HTTPS URL  (use this to save in DB)
 // req.file.filename → the public_id assigned by Cloudinary
 
