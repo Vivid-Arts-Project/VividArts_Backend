@@ -67,7 +67,9 @@ db.sequelize.authenticate()
     await ensureCustomerProfileColumns(db.sequelize);
     await ensureOrderWorkflowColumns(db.sequelize);
     await ensurePriceCatalog();
-    await db.GalleryImage.sync();
+    // Create any missing model tables without dropping or altering existing data.
+    // This includes the payment and order workflow tables required before PayHere checkout.
+    await db.sequelize.sync({ alter: false });
     app.listen(port, () => console.log(`✓ Server running on http://localhost:${port}`));
   })
   .catch(err => console.error('✗ DB connection failed:', err));
