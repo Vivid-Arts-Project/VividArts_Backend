@@ -7,7 +7,7 @@ const { Customer } = require('../models');
 const { Op } = require('sequelize');
 const { sendEmail } = require('../middleware/email');
 
-const { uploadProfile, uploadCover, deleteImage } = require('../middleware/upload');
+const { uploadProfile, uploadProfileImage, uploadCover, deleteImage } = require('../middleware/upload');
 const { JWT_SECRET } = require('../config/auth');
 
 // 💡 Importing the Notification Model
@@ -114,10 +114,10 @@ router.post('/register/verify-otp', (req, res) => {
 // ✅ 3. COMPLETE REGISTER ROUTE
 router.post('/register', async (req, res) => {
   try {
-    const { username, email, password, confirmPassword, verificationToken } = req.body;
+    const { fullName, username, phoneNumber, email, password, confirmPassword, verificationToken } = req.body;
 
-    if (!username || !email || !password || !confirmPassword) {
-      return res.status(400).json({ message: 'Username, email, password and confirmation are required.' });
+    if (!fullName || !username || !phoneNumber || !email || !password || !confirmPassword) {
+      return res.status(400).json({ message: 'Full name, username, phone number, email, password and confirmation are required.' });
     }
 
     if (password !== confirmPassword) {
@@ -126,9 +126,11 @@ router.post('/register', async (req, res) => {
 
     const normalizedEmail = email.trim().toLowerCase();
     const normalizedUsername = username.trim();
+    const normalizedFullName = fullName.trim();
+    const normalizedPhoneNumber = phoneNumber.trim();
 
-    if (!normalizedUsername || !normalizedEmail) {
-      return res.status(400).json({ message: 'Username and email cannot be blank.' });
+    if (!normalizedFullName || !normalizedUsername || !normalizedPhoneNumber || !normalizedEmail) {
+      return res.status(400).json({ message: 'Full name, username, phone number and email cannot be blank.' });
     }
 
     if (password.length < 8) {
@@ -147,9 +149,9 @@ router.post('/register', async (req, res) => {
       username: normalizedUsername,
       email: normalizedEmail,
       password_hash: hashedPassword,
-      full_name: normalizedUsername,
+      full_name: normalizedFullName,
       address: 'N/A',
-      phone_number: 'N/A',
+      phone_number: normalizedPhoneNumber,
     });
     verifiedEmailTokens.delete(verificationToken);
 
@@ -262,12 +264,13 @@ router.post('/profile/avatar', async (req, res) => {
       if (!customer) return res.status(404).json({ message: 'Customer not found.' });
 
       const previousPublicId = customer.profile_image_public_id;
+      const uploadedImage = await uploadProfileImage(req.file, customer.customer_id);
 
-      customer.profile_image_url = req.file.path;
-      customer.profile_image_public_id = req.file.filename;
+      customer.profile_image_url = uploadedImage.url;
+      customer.profile_image_public_id = uploadedImage.publicId;
       await customer.save();
 
-      try { if (previousPublicId && previousPublicId !== req.file.filename) await deleteImage(previousPublicId); } catch (e) { /* ignore */ }
+      try { if (previousPublicId && previousPublicId !== uploadedImage.publicId) await deleteImage(previousPublicId); } catch (e) { /* ignore */ }
 
       res.json({ message: 'Profile image updated.', profile_image_url: customer.profile_image_url });
     });
@@ -328,8 +331,10 @@ router.put('/profile', async (req, res) => {
       return res.status(404).json({ message: 'Customer not found.' });
     }
 
-    const { username, email } = req.body;
+    const { fullName, username, phoneNumber, email } = req.body;
+    if (fullName !== undefined) customer.full_name = String(fullName).trim();
     if (username) customer.username = username;
+    if (phoneNumber !== undefined) customer.phone_number = String(phoneNumber).trim();
     if (email) customer.email = email;
 
     await customer.save();
@@ -338,7 +343,9 @@ router.put('/profile', async (req, res) => {
       message: 'Profile updated successfully.',
       customer: {
         customer_id: customer.customer_id,
+        full_name: customer.full_name,
         username: customer.username,
+        phone_number: customer.phone_number,
         email: customer.email,
         role: 'customer',
       },

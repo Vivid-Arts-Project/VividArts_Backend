@@ -9,6 +9,7 @@ const port    = Number(process.env.PORT) || 3001;
 // ── 1. Body parsers ───────────────────────────────────────────────────────────
 app.use(express.json());
 app.use(express.urlencoded({ extended: true })); // needed for PayHere webhook
+app.use('/uploads', express.static(require('path').join(__dirname, 'uploads')));
 
 // ── 2. CORS ───────────────────────────────────────────────────────────────────
 const allowedOrigins = [

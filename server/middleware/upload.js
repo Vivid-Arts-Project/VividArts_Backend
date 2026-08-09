@@ -1,5 +1,8 @@
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 // ─── Configure Cloudinary from .env ─────────────────────────────────────────
 cloudinary.config({
@@ -132,7 +135,9 @@ const uploadReferences = multer({
 }).array('referencePhotos', 5);
 
 const uploadProfile = multer({
-  storage: profileStorage,
+  // Keep the avatar in memory so the route can either upload it to Cloudinary
+  // or safely fall back to the application's local uploads directory.
+  storage: multer.memoryStorage(),
   fileFilter: imageFilter,
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
 }).single('profileImage');
@@ -157,4 +162,34 @@ const deleteImage = async (publicId) => {
   await cloudinary.uploader.destroy(publicId);
 };
 
-module.exports = { uploadProof, uploadReferences, uploadProfile, uploadCover, uploadGallery, deleteImage, cloudinary };
+const uploadProfileImage = async (file, customerId) => {
+  const uploadOptions = {
+    folder: 'art-studio/profiles',
+    public_id: `profile_${customerId}_${Date.now()}`,
+    transformation: [{ width: 512, height: 512, crop: 'fill', quality: 'auto', fetch_format: 'auto' }],
+    resource_type: 'image',
+  };
+
+  try {
+    const result = await new Promise((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(uploadOptions, (error, uploaded) => {
+        if (error) reject(error);
+        else resolve(uploaded);
+      });
+      stream.end(file.buffer);
+    });
+    return { url: result.secure_url, publicId: result.public_id };
+  } catch (cloudinaryError) {
+    // A local fallback keeps profile updates working if Cloudinary credentials
+    // or connectivity are temporarily unavailable during development.
+    const extension = path.extname(file.originalname).toLowerCase() || '.jpg';
+    const filename = `profile_${customerId}_${Date.now()}_${crypto.randomUUID()}${extension}`;
+    const profilesDirectory = path.resolve(__dirname, '..', 'uploads', 'profiles');
+    await fs.promises.mkdir(profilesDirectory, { recursive: true });
+    await fs.promises.writeFile(path.join(profilesDirectory, filename), file.buffer);
+    console.warn('[profile] Cloudinary upload failed; saved avatar locally:', cloudinaryError.message);
+    return { url: `/uploads/profiles/${filename}`, publicId: null };
+  }
+};
+
+module.exports = { uploadProof, uploadReferences, uploadProfile, uploadProfileImage, uploadCover, uploadGallery, deleteImage, cloudinary };
