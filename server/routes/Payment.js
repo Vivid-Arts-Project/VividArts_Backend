@@ -7,6 +7,7 @@ const { Payment } = db;
 const { ensureInvoiceGenerated } = require('../utils/invoice');
 const { getCatalog, calculateOrder } = require('../utils/pricing');
 const { JWT_SECRET } = require('../config/auth');
+const { uploadReferences, deleteImage } = require('../middleware/upload');
 
 const requireAdmin = (req, res, next) => {
   if (!req.session?.adminId) return res.status(401).json({ error: 'Unauthorized' });
@@ -91,6 +92,45 @@ const createCommission = async (req, computedOrder, payment) => {
     return order;
   });
 };
+
+router.post('/orders/:id/reference-photos', requireCustomer, async (req, res) => {
+  const order = await db.Order.findOne({
+    where: { order_id: req.params.id, customer_id: req.customerId },
+    attributes: ['order_id'],
+  }).catch(error => {
+    res.status(500).json({ success: false, error: error.message });
+    return null;
+  });
+  if (res.headersSent) return;
+  if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
+
+  uploadReferences(req, res, async uploadError => {
+    if (uploadError) return res.status(400).json({ success: false, error: uploadError.message });
+    if (!req.files?.length) return res.status(400).json({ success: false, error: 'Select at least one reference photo' });
+
+    try {
+      const existingCount = await db.ReferencePhoto.count({ where: { order_id: order.order_id } });
+      if (existingCount + req.files.length > 5) {
+        await Promise.all(req.files.map(file => deleteImage(file.filename).catch(() => {})));
+        return res.status(400).json({ success: false, error: 'An order can have up to 5 reference photos' });
+      }
+
+      const photos = await db.ReferencePhoto.bulkCreate(req.files.map((file, index) => ({
+        order_id: order.order_id,
+        cloudinary_url: file.path,
+        cloudinary_public_id: file.filename,
+        original_filename: file.originalname,
+        file_size_bytes: file.size,
+        mime_type: file.mimetype,
+        sort_order: existingCount + index,
+      })));
+      res.status(201).json({ success: true, photos: photos.map(photo => photo.cloudinary_url) });
+    } catch (error) {
+      await Promise.all(req.files.map(file => deleteImage(file.filename).catch(() => {})));
+      res.status(500).json({ success: false, error: 'Unable to save reference photos' });
+    }
+  });
+});
 
 const isPlaceholderValue = (value) => !value || String(value).trim().toLowerCase().startsWith('your');
 

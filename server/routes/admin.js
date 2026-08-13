@@ -12,9 +12,14 @@ const orderJson = (instance) => {
   const o = typeof instance?.toJSON === 'function' ? instance.toJSON() : instance;
   if (!o) return null;
   const p = o.productOption || {};
+  const customer = o.customer ? {
+    ...o.customer,
+    fullName: o.customer.full_name || o.customer.username,
+    phone: o.customer.phone_number,
+  } : null;
   const completedPaid = (o.payments || []).filter(payment => payment.status === 'completed').reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
-  return { ...o, id: o.order_id, customerId: o.customer_id, totalPrice: o.calculated_price,
-    amountPaid: completedPaid || Number(o.amount_paid || 0), paymentType: 'advance', isUrgent: o.is_urgent,
+  return { ...o, customer, id: o.order_id, customerId: o.customer_id, totalPrice: o.calculated_price,
+    amountPaid: completedPaid || Number(o.amount_paid || 0), paymentType: o.payment_type, isUrgent: o.is_urgent,
     artistLocation: o.artist_location, paperSize: p.paper_size,
     subjectCount: p.num_subjects ? `${p.num_subjects}_subjects` : null,
     frameType: p.frame_type, pickupOption: p.pickup_option, urgentDeadline: p.urgent_deadline,
@@ -148,7 +153,7 @@ router.post('/pricing/calculate', async (req, res) => {
 router.get('/orders', requireAdmin, async (req, res) => {
   try {
     const orders = await db.Order.findAll({
-      include: [{ model: db.Customer, as: 'customer' }, { model: db.ProductOption, as: 'productOption' }, { model: db.ProofImage, as: 'proofImages' }, { model: db.Payment, as: 'payments' }],
+      include: [{ model: db.Customer, as: 'customer' }, { model: db.ProductOption, as: 'productOption' }, { model: db.ReferencePhoto, as: 'referencePhotos' }, { model: db.ProofImage, as: 'proofImages' }, { model: db.Payment, as: 'payments' }],
       order: [['is_urgent', 'DESC'], ['createdAt', 'ASC']],
     });
     const stats = {
@@ -187,10 +192,35 @@ router.get('/orders/:id', requireAdmin, async (req, res) => {
         { model: db.ProductOption, as: 'productOption' },
         { model: db.ReferencePhoto, as: 'referencePhotos' },
         { model: db.ProofImage, as: 'proofImages' },
+        { model: db.Payment, as: 'payments' },
       ],
     });
     if (!order) return res.status(404).json({ error: 'Order not found' });
     res.json(orderJson(order));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.get('/orders/:id/reference-photos/:index/download', requireAdmin, async (req, res) => {
+  try {
+    const index = Number.parseInt(req.params.index, 10);
+    if (!Number.isInteger(index) || index < 0) return res.status(400).json({ error: 'Invalid photo index' });
+
+    const order = await db.Order.findByPk(req.params.id, {
+      include: [{ model: db.ReferencePhoto, as: 'referencePhotos' }],
+    });
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    const photo = order.referencePhotos?.[index];
+    if (!photo?.cloudinary_url) return res.status(404).json({ error: 'Reference photo not found' });
+
+    const url = new URL(photo.cloudinary_url);
+    if (url.protocol !== 'https:' || url.hostname !== 'res.cloudinary.com') {
+      return res.status(400).json({ error: 'Unsupported reference photo source' });
+    }
+
+    const filename = `order-${order.order_id.slice(0, 8)}-reference-${index + 1}`;
+    const downloadUrl = photo.cloudinary_url.replace('/upload/', `/upload/fl_attachment:${filename}/`);
+    return res.redirect(downloadUrl);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -223,7 +253,7 @@ router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
     }
 
     // Email යැවීම
-    await sendStatusUpdateEmail(order.customer.email, order.customer.fullName, order.id, status);
+    await sendStatusUpdateEmail(order.customer.email, order.customer.full_name || order.customer.username, order.order_id, status);
 
     // Notification එක සෑදීම
     let title = '📌 Order Status Updated';
