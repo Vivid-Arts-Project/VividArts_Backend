@@ -1,6 +1,7 @@
 const express = require('express');
 const router  = express.Router();
 const db      = require('../models');
+const { createAdminNotification } = require('../utils/adminNotificationHelper');
 
 // ── POST /api/admin/register ──────────────────────────────────────────────────
 // Creates a new admin account and stores it in the Admins table.
@@ -38,6 +39,12 @@ router.post('/register', async (req, res) => {
 
     // Log in automatically after registering
     req.session.adminId = admin.id;
+    await createAdminNotification({
+      adminId: admin.id,
+      type: 'system',
+      title: 'Account ready',
+      message: `Administrator account created for ${admin.username}.`,
+    });
 
     res.status(201).json({
       message: 'Admin account created',
@@ -62,6 +69,12 @@ router.post('/login', async (req, res) => {
     }
 
     req.session.adminId = admin.id;
+    await createAdminNotification({
+      adminId: admin.id,
+      type: 'system',
+      title: 'System ready',
+      message: `Logged in as ${admin.username}.`,
+    });
     res.json({ message: 'Logged in', admin: safeAdmin(admin) });
   } catch (err) {
     res.status(500).json({ error: err.message });

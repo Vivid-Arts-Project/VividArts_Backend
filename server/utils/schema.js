@@ -33,4 +33,18 @@ async function ensureOrderWorkflowColumns(sequelize) {
   }
 }
 
-module.exports = { ensureCustomerProfileColumns, ensureOrderWorkflowColumns };
+async function ensureNotificationOrderIdColumn(sequelize) {
+  const queryInterface = sequelize.getQueryInterface();
+  let columns;
+  try { columns = await queryInterface.describeTable('Notifications'); }
+  catch { return; }
+  const currentType = String(columns.orderId?.type || '').toUpperCase();
+  if (columns.orderId && !currentType.includes('CHAR') && !currentType.includes('UUID')) {
+    await queryInterface.changeColumn('Notifications', 'orderId', {
+      type: DataTypes.UUID,
+      allowNull: true,
+    });
+  }
+}
+
+module.exports = { ensureCustomerProfileColumns, ensureOrderWorkflowColumns, ensureNotificationOrderIdColumn };

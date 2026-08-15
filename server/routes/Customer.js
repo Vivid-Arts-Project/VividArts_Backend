@@ -3,15 +3,12 @@ const router = express.Router();
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
-const { Customer } = require('../models');
+const { Customer, Notification } = require('../models');
 const { Op } = require('sequelize');
 const { sendEmail } = require('../middleware/email');
 
 const { uploadProfile, uploadProfileImage, uploadCover, deleteImage } = require('../middleware/upload');
 const { JWT_SECRET } = require('../config/auth');
-
-// 💡 Importing the Notification Model
-const Notification = require('../models/Notification');
 
 const OTP_LIFETIME_MS = 10 * 60 * 1000;
 const pendingEmailVerifications = new Map();
@@ -398,7 +395,11 @@ router.put('/notifications/:id/read', async (req, res) => {
       return res.status(401).json({ message: 'Invalid authentication token.' });
     }
 
-    await Notification.update({ isRead: true }, { where: { id: req.params.id } });
+    const updated = await Notification.update(
+      { isRead: true },
+      { where: { id: req.params.id, customerId: decoded.customerId } },
+    );
+    if (!updated[0]) return res.status(404).json({ message: 'Notification not found.' });
 
     res.json({ success: true, message: 'Notification marked as read.' });
   } catch (error) {
