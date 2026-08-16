@@ -35,7 +35,10 @@ router.get('/my-orders', protect, async (req, res) => {
 
       return {
         id: order.order_id,
-        status: order.status,
+        // A revision returns to active drawing for the customer, while the
+        // admin retains the actionable revision_requested state.
+        status: order.status === 'revision_requested' ? 'sketching' : order.status,
+        workflowStatus: order.status,
         createdAt: order.createdAt,
         updatedAt: order.updatedAt,
         completedAt: order.completed_at,
