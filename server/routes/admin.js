@@ -27,7 +27,9 @@ const orderJson = (instance) => {
     customerNote: p.customer_note,
     referencePhotos: (o.referencePhotos || []).map(photo => photo.cloudinary_url),
     proofImagePath: o.proofImages?.find(proof => proof.is_current)?.cloudinary_url || null,
-    messages: (o.messages || []).map(m => ({ ...m, senderType: m.sender_type, message: m.message_text })),
+    messages: [...(o.messages || [])]
+      .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+      .map(m => ({ ...m, senderType: m.sender_type, message: m.message_text })),
   };
 };
 
@@ -202,7 +204,7 @@ router.post('/pricing/calculate', async (req, res) => {
 router.get('/orders', requireAdmin, async (req, res) => {
   try {
     const orders = await db.Order.findAll({
-      include: [{ model: db.Customer, as: 'customer' }, { model: db.ProductOption, as: 'productOption' }, { model: db.ReferencePhoto, as: 'referencePhotos' }, { model: db.ProofImage, as: 'proofImages' }, { model: db.Payment, as: 'payments' }],
+      include: [{ model: db.Customer, as: 'customer' }, { model: db.ProductOption, as: 'productOption' }, { model: db.ReferencePhoto, as: 'referencePhotos' }, { model: db.ProofImage, as: 'proofImages' }, { model: db.Payment, as: 'payments' }, { model: db.Message, as: 'messages' }],
       order: [['is_urgent', 'DESC'], ['createdAt', 'ASC']],
     });
     const stats = {
@@ -211,6 +213,8 @@ router.get('/orders', requireAdmin, async (req, res) => {
       sketching:       orders.filter(o => o.status === 'sketching').length,
       urgentActive:    orders.filter(o => o.isUrgent && !['finished','done'].includes(o.status)).length,
       waitingFeedback: orders.filter(o => o.status === 'waiting_for_feedback').length,
+      revisionRequested: orders.filter(o => o.status === 'revision_requested').length,
+      approved:        orders.filter(o => o.status === 'approved').length,
       totalValue:      orders.reduce((sum, o) => sum + Number(o.calculated_price || 0), 0),
       totalCollected:  orders.reduce((sum, o) => sum + Number(o.amount_paid || 0), 0),
     };
