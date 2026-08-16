@@ -8,6 +8,7 @@ const { ensureInvoiceGenerated } = require('../utils/invoice');
 const { getCatalog, calculateOrder } = require('../utils/pricing');
 const { JWT_SECRET } = require('../config/auth');
 const { uploadReferences, deleteImage } = require('../middleware/upload');
+const { createAdminNotification } = require('../utils/adminNotificationHelper');
 
 const requireAdmin = (req, res, next) => {
   if (!req.session?.adminId) return res.status(401).json({ error: 'Unauthorized' });
@@ -225,6 +226,12 @@ router.post('/create-order', requireCustomer, async (req, res) => {
 
     const payment = await Payment.create(orderData);
     const commission = await createCommission(req, computedOrder, payment);
+    await createAdminNotification({
+      orderId: commission.order_id,
+      type: 'order',
+      title: 'New portrait order',
+      message: `A new ${computedOrder.sizeLabel || computedOrder.sizeId} portrait order was placed.`,
+    });
 
     res.status(201).json({
       success: true,
@@ -239,9 +246,9 @@ router.post('/create-order', requireCustomer, async (req, res) => {
     });
   } catch (error) {
     console.error('Error creating order:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to create order' 
+    res.status(500).json({
+      success: false,
+      error: 'Failed to create order'
     });
   }
 });
@@ -277,6 +284,12 @@ router.post('/create-payhere-checkout', requireCustomer, async (req, res) => {
       status: 'pending'
     });
     const commission = await createCommission(req, computedOrder, payment);
+    await createAdminNotification({
+      orderId: commission.order_id,
+      type: 'order',
+      title: 'New portrait order',
+      message: `A new ${computedOrder.sizeLabel || computedOrder.sizeId} portrait order was placed.`,
+    });
 
     const hash = createPayhereCheckoutHash({
       merchantId: PAYHERE_MERCHANT_ID,
@@ -461,9 +474,9 @@ router.post('/process', requireCustomer, async (req, res) => {
     // Find the payment record
     const payment = await Payment.findOne({ where: { payhereOrderId: orderId } });
     if (!payment) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Order not found' 
+      return res.status(404).json({
+        success: false,
+        error: 'Order not found'
       });
     }
 

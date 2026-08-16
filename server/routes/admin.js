@@ -1,12 +1,13 @@
 const express  = require('express');
 const router   = express.Router();
 const db       = require('../models');
-const { uploadProof }          = require('../middleware/upload');
+const { uploadProof, deleteImage } = require('../middleware/upload');
 const { sendProofReadyEmail, sendStatusUpdateEmail } = require('../middleware/email');
 const { calculatePrice, loadPrices }                = require('../middleware/pricingEngine');
 
 // 💡 Importing the Notification Helper
 const { createNotification } = require('../utils/notificationHelper');
+const { createAdminNotification } = require('../utils/adminNotificationHelper');
 
 const orderJson = (instance) => {
   const o = typeof instance?.toJSON === 'function' ? instance.toJSON() : instance;
@@ -65,6 +66,54 @@ const requireAdmin = (req, res, next) => {
   if (!req.session?.adminId) return res.status(401).json({ error: 'Unauthorized' });
   next();
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// ADMIN ACTIVITY NOTIFICATIONS
+// ════════════════════════════════════════════════════════════════════════════
+
+router.get('/activity-notifications', requireAdmin, async (req, res) => {
+  try {
+    const notifications = await db.AdminNotification.findAll({
+      where: { admin_id: req.session.adminId },
+      order: [['createdAt', 'DESC']],
+    });
+    res.json({
+      notifications,
+      unreadCount: notifications.filter(notification => !notification.is_read).length,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.patch('/activity-notifications/read-all', requireAdmin, async (req, res) => {
+  try {
+    await db.AdminNotification.update(
+      { is_read: true },
+      { where: { admin_id: req.session.adminId, is_read: false } },
+    );
+    res.json({ message: 'All notifications marked as read' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.patch('/activity-notifications/:id/read', requireAdmin, async (req, res) => {
+  try {
+    const notification = await db.AdminNotification.findOne({
+      where: { id: req.params.id, admin_id: req.session.adminId },
+    });
+    if (!notification) return res.status(404).json({ error: 'Notification not found' });
+    await notification.update({ is_read: true });
+    res.json({ message: 'Notification marked as read', notification });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.delete('/activity-notifications/:id', requireAdmin, async (req, res) => {
+  try {
+    const deleted = await db.AdminNotification.destroy({
+      where: { id: req.params.id, admin_id: req.session.adminId },
+    });
+    if (!deleted) return res.status(404).json({ error: 'Notification not found' });
+    res.json({ message: 'Notification deleted' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 // ════════════════════════════════════════════════════════════════════════════
 // ADMIN PROFILE  (Settings page reads and writes these)
@@ -224,6 +273,53 @@ router.get('/orders/:id/reference-photos/:index/download', requireAdmin, async (
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+router.delete('/orders/:id', requireAdmin, async (req, res) => {
+  try {
+    const order = await db.Order.findByPk(req.params.id, {
+      include: [
+        { model: db.ReferencePhoto, as: 'referencePhotos' },
+        { model: db.ProofImage, as: 'proofImages' },
+      ],
+    });
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    const productId = order.product_id;
+    const publicIds = [
+      ...(order.referencePhotos || []).map(photo => photo.cloudinary_public_id),
+      ...(order.proofImages || []).map(proof => proof.cloudinary_public_id),
+    ].filter(Boolean);
+
+    await db.sequelize.transaction(async transaction => {
+      await db.Message.destroy({ where: { order_id: order.order_id }, transaction });
+      await db.ReferencePhoto.destroy({ where: { order_id: order.order_id }, transaction });
+      await db.ProofImage.destroy({ where: { order_id: order.order_id }, transaction });
+      await db.Payment.destroy({ where: { order_id: order.order_id }, transaction });
+      await order.destroy({ transaction });
+      if (productId) await db.ProductOption.destroy({ where: { product_id: productId }, transaction });
+    });
+
+    await Promise.allSettled(publicIds.map(deleteImage));
+    const cancellationReason = req.body?.reason?.trim();
+    await createNotification(
+      order.customer_id,
+      null,
+      'Order cancelled',
+      cancellationReason
+        ? `Your portrait order was cancelled by the studio. Reason: ${cancellationReason}`
+        : 'Your portrait order was cancelled by the studio.',
+      'cancelled',
+    );
+    await createAdminNotification({
+      adminId: req.session.adminId,
+      type: 'order',
+      title: 'Order cancelled',
+      message: `Order #${order.order_id.slice(0, 8)} was permanently deleted${cancellationReason ? `: ${cancellationReason}` : '.'}`,
+    });
+
+    res.json({ message: 'Order cancelled and deleted' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // 💡 status update වෙන තැනට Notification හදන කෑල්ල එකතු කර ඇත
 router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
   try {
@@ -303,8 +399,8 @@ router.post('/orders/:id/proof', requireAdmin, (req, res) => {
       await createNotification(
         order.customer_id,
         order.order_id,
-        '🖼️ New Proof Image Uploaded', 
-        'The artist has uploaded a proof of your portrait! Please check and give feedback.', 
+        '🖼️ New Proof Image Uploaded',
+        'The artist has uploaded a proof of your portrait! Please check and give feedback.',
         'waiting_for_feedback'
       );
 
