@@ -27,7 +27,9 @@ const orderJson = (instance) => {
     customerNote: p.customer_note,
     referencePhotos: (o.referencePhotos || []).map(photo => photo.cloudinary_url),
     proofImagePath: o.proofImages?.find(proof => proof.is_current)?.cloudinary_url || null,
-    messages: (o.messages || []).map(m => ({ ...m, senderType: m.sender_type, message: m.message_text })),
+    messages: [...(o.messages || [])]
+      .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+      .map(m => ({ ...m, senderType: m.sender_type, message: m.message_text })),
   };
 };
 
@@ -202,15 +204,17 @@ router.post('/pricing/calculate', async (req, res) => {
 router.get('/orders', requireAdmin, async (req, res) => {
   try {
     const orders = await db.Order.findAll({
-      include: [{ model: db.Customer, as: 'customer' }, { model: db.ProductOption, as: 'productOption' }, { model: db.ReferencePhoto, as: 'referencePhotos' }, { model: db.ProofImage, as: 'proofImages' }, { model: db.Payment, as: 'payments' }],
+      include: [{ model: db.Customer, as: 'customer' }, { model: db.ProductOption, as: 'productOption' }, { model: db.ReferencePhoto, as: 'referencePhotos' }, { model: db.ProofImage, as: 'proofImages' }, { model: db.Payment, as: 'payments' }, { model: db.Message, as: 'messages' }],
       order: [['is_urgent', 'DESC'], ['createdAt', 'ASC']],
     });
     const stats = {
-      total:           orders.length,
+      total:           orders.filter(o => o.status !== 'done').length,
       inQueue:         orders.filter(o => o.status === 'in_queue').length,
       sketching:       orders.filter(o => o.status === 'sketching').length,
-      urgentActive:    orders.filter(o => o.isUrgent && !['finished','done'].includes(o.status)).length,
+      urgentActive:    orders.filter(o => o.isUrgent && o.status !== 'done').length,
       waitingFeedback: orders.filter(o => o.status === 'waiting_for_feedback').length,
+      revisionRequested: orders.filter(o => o.status === 'revision_requested').length,
+      approved:        orders.filter(o => ['approved', 'finished'].includes(o.status)).length,
       totalValue:      orders.reduce((sum, o) => sum + Number(o.calculated_price || 0), 0),
       totalCollected:  orders.reduce((sum, o) => sum + Number(o.amount_paid || 0), 0),
     };
@@ -324,7 +328,7 @@ router.delete('/orders/:id', requireAdmin, async (req, res) => {
 router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
   try {
     const { status, customMessage } = req.body;
-    const valid = ['in_queue','sketching','waiting_for_feedback','finished','framed','shipped','done'];
+    const valid = ['in_queue','sketching','waiting_for_feedback','revision_requested','approved','finished','framed','shipped','done'];
     if (!valid.includes(status)) return res.status(400).json({ error: 'Invalid status' });
 
     const order = await db.Order.findByPk(req.params.id, {
@@ -333,6 +337,21 @@ router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
     const product = await order.getProductOption();
+    const current = order.status === 'finished' ? 'approved' : order.status;
+    const requested = status === 'finished' ? 'approved' : status;
+    const allowedNext = {
+      in_queue: ['in_queue', 'sketching'],
+      sketching: ['sketching'],
+      waiting_for_feedback: ['waiting_for_feedback'],
+      revision_requested: ['revision_requested'],
+      approved: ['approved', ...(product?.frame_type && product.frame_type !== 'without_frame' ? ['framed'] : product?.pickup_option === 'courier' ? ['shipped'] : ['done'])],
+      framed: ['framed', ...(product?.pickup_option === 'courier' ? ['shipped'] : ['done'])],
+      shipped: ['shipped', 'done'],
+      done: ['done'],
+    };
+    if (!allowedNext[current]?.includes(requested)) {
+      return res.status(400).json({ error: 'This status change is not available at the current workflow stage' });
+    }
     if (status === 'framed' && (!product?.frame_type || product.frame_type === 'without_frame')) {
       return res.status(400).json({ error: 'Framed status is only available for framed orders' });
     }
@@ -340,7 +359,7 @@ router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
       return res.status(400).json({ error: 'Shipped status is only available for courier orders' });
     }
 
-    await order.update({ status });
+    await order.update({ status: requested, ...(requested === 'done' ? { completed_at: new Date() } : {}) });
 
     if (status === 'shipped' && order.pickupOption === 'pickup') {
       const admin = await db.Admin.findByPk(req.session.adminId);

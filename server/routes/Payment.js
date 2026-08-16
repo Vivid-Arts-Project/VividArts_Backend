@@ -179,8 +179,10 @@ const syncLinkedOrderPayment = async (payment) => {
   const completed = await Payment.sum('amount', {
     where: { order_id: payment.order_id, status: 'completed' },
   });
+  const order = await db.Order.findByPk(payment.order_id, { attributes: ['calculated_price'] });
+  const paidInFull = order && Number(completed || 0) >= Number(order.calculated_price || 0);
   await db.Order.update(
-    { amount_paid: Number(completed || 0), payment_type: 'advance' },
+    { amount_paid: Number(completed || 0), payment_type: paidInFull ? 'full' : 'advance' },
     { where: { order_id: payment.order_id } },
   );
 };
@@ -351,6 +353,64 @@ router.post('/create-payhere-checkout', requireCustomer, async (req, res) => {
       success: false,
       error: 'Failed to create PayHere checkout'
     });
+  }
+});
+
+// Pay the outstanding balance for an existing, customer-approved order.
+router.post('/orders/:id/balance-checkout', requireCustomer, async (req, res) => {
+  try {
+    const configError = validatePayhereConfig();
+    if (configError) return res.status(500).json({ success: false, error: configError });
+
+    const order = await db.Order.findOne({
+      where: { order_id: req.params.id, customer_id: req.customerId },
+      include: [{ model: db.Customer, as: 'customer' }],
+    });
+    if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
+    if (!['approved', 'finished'].includes(order.status)) {
+      return res.status(400).json({ success: false, error: 'The balance is available after proof approval' });
+    }
+
+    const completed = Number(await Payment.sum('amount', {
+      where: { order_id: order.order_id, status: 'completed' },
+    }) || 0);
+    const balance = Math.max(0, Number(order.calculated_price || 0) - completed);
+    if (balance <= 0) return res.status(400).json({ success: false, error: 'This order is already paid in full' });
+
+    const currency = order.currency || 'LKR';
+    if (!PAYHERE_ALLOWED_CURRENCIES.includes(currency)) {
+      return res.status(400).json({ success: false, error: `PayHere is not configured for ${currency}` });
+    }
+
+    const gatewayAmount = calculateDisplayAmount(balance, currency);
+    const payment = await Payment.create({
+      payhereOrderId: createOrderId(), order_id: order.order_id, amount: balance,
+      currency, paymentMethod: 'card', paymentType: 'full', status: 'pending',
+    });
+    const hash = createPayhereCheckoutHash({
+      merchantId: PAYHERE_MERCHANT_ID, orderId: payment.payhereOrderId,
+      amount: gatewayAmount, currency, merchantSecret: PAYHERE_MERCHANT_SECRET,
+    });
+    const fullName = (order.customer?.full_name || order.customer?.username || 'Vivid Customer').trim();
+    const [firstName, ...lastNameParts] = fullName.split(/\s+/);
+    const checkoutFields = {
+      merchant_id: PAYHERE_MERCHANT_ID,
+      return_url: `${FRONTEND_URL}/commission/payment?payment=success&order_id=${payment.payhereOrderId}`,
+      cancel_url: `${FRONTEND_URL}/my-orders`,
+      notify_url: `${BACKEND_URL}/api/payments/payhere-notify`,
+      order_id: payment.payhereOrderId,
+      items: `Vivid Arts order ${order.order_id.slice(0, 8)} balance`,
+      currency, amount: gatewayAmount,
+      first_name: firstName || 'Vivid', last_name: lastNameParts.join(' ') || '-',
+      email: order.customer?.email || 'customer@example.com',
+      phone: order.customer?.phone_number || '0771234567',
+      address: order.customer?.address || 'Colombo', city: 'Colombo', country: 'Sri Lanka', hash,
+    };
+    await payment.update({ payhereMd5sig: hash, metadata: { balancePayment: true, checkoutAmount: gatewayAmount, checkoutCurrency: currency } });
+    res.status(201).json({ success: true, checkoutUrl: PAYHERE_CHECKOUT_URL, checkoutFields, orderId: payment.payhereOrderId });
+  } catch (error) {
+    console.error('Error creating balance checkout:', error);
+    res.status(500).json({ success: false, error: 'Failed to create balance checkout' });
   }
 });
 
