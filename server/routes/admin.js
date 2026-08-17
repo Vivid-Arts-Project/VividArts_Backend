@@ -8,6 +8,7 @@ const { calculatePrice, loadPrices }                = require('../middleware/pri
 // 💡 Importing the Notification Helper
 const { createNotification } = require('../utils/notificationHelper');
 const { createAdminNotification } = require('../utils/adminNotificationHelper');
+const { calculateCompletionFromSketchingStart, sortProductionQueue } = require('../utils/scheduling');
 
 const orderJson = (instance) => {
   const o = typeof instance?.toJSON === 'function' ? instance.toJSON() : instance;
@@ -205,7 +206,6 @@ router.get('/orders', requireAdmin, async (req, res) => {
   try {
     const orders = await db.Order.findAll({
       include: [{ model: db.Customer, as: 'customer' }, { model: db.ProductOption, as: 'productOption' }, { model: db.ReferencePhoto, as: 'referencePhotos' }, { model: db.ProofImage, as: 'proofImages' }, { model: db.Payment, as: 'payments' }, { model: db.Message, as: 'messages' }],
-      order: [['is_urgent', 'DESC'], ['createdAt', 'ASC']],
     });
     const stats = {
       total:           orders.filter(o => o.status !== 'done').length,
@@ -218,7 +218,7 @@ router.get('/orders', requireAdmin, async (req, res) => {
       totalValue:      orders.reduce((sum, o) => sum + Number(o.calculated_price || 0), 0),
       totalCollected:  orders.reduce((sum, o) => sum + Number(o.amount_paid || 0), 0),
     };
-    res.json({ orders: orders.map(orderJson), stats });
+    res.json({ orders: sortProductionQueue(orders).map(orderJson), stats });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -359,7 +359,21 @@ router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
       return res.status(400).json({ error: 'Shipped status is only available for courier orders' });
     }
 
-    await order.update({ status: requested, ...(requested === 'done' ? { completed_at: new Date() } : {}) });
+    const statusUpdate = {
+      status: requested,
+      ...(requested === 'done' ? { completed_at: new Date() } : {}),
+    };
+    if (requested === 'sketching' && !order.sketching_started_at) {
+      const sketchingStartedAt = new Date();
+      statusUpdate.sketching_started_at = sketchingStartedAt;
+      statusUpdate.estimated_completion_at = calculateCompletionFromSketchingStart({
+        start: sketchingStartedAt,
+        isUrgent: Boolean(order.is_urgent || product?.is_urgent),
+        urgentDeadline: product?.urgent_deadline,
+        people: product?.num_subjects,
+      });
+    }
+    await order.update(statusUpdate);
 
     if (status === 'shipped' && order.pickupOption === 'pickup') {
       const admin = await db.Admin.findByPk(req.session.adminId);

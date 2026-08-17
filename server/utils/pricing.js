@@ -65,6 +65,21 @@ async function calculateOrder(order = {}) {
   const urgentDeadline = urgent && /^\d{4}-\d{2}-\d{2}$/.test(order.urgentDeadline || '')
     ? order.urgentDeadline
     : null;
+  if (urgent) {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const earliest = new Date(today);
+    earliest.setDate(earliest.getDate() + 1);
+    const latest = new Date(today);
+    latest.setDate(latest.getDate() + 7);
+    const requested = urgentDeadline ? new Date(`${urgentDeadline}T00:00:00`) : null;
+
+    if (!requested || Number.isNaN(requested.getTime()) || requested < earliest || requested > latest) {
+      const error = new Error('Urgent orders must have a completion date within the next 7 days.');
+      error.statusCode = 400;
+      throw error;
+    }
+  }
   const deliveryMethod = order.deliveryMethod === 'pickup' ? 'pickup' : 'courier';
   const deliveryAddress = deliveryMethod === 'courier' && typeof order.deliveryAddress === 'string'
     ? order.deliveryAddress.trim().slice(0, 300)

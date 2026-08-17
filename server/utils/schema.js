@@ -31,6 +31,37 @@ async function ensureOrderWorkflowColumns(sequelize) {
       type: DataTypes.STRING(40), allowNull: false, defaultValue: 'in_queue',
     });
   }
+  if (!columns.sketching_started_at) {
+    await queryInterface.addColumn('Orders', 'sketching_started_at', {
+      type: DataTypes.DATE,
+      allowNull: true,
+    });
+  }
+  if (!columns.estimated_completion_at) {
+    await queryInterface.addColumn('Orders', 'estimated_completion_at', {
+      type: DataTypes.DATEONLY,
+      allowNull: true,
+    });
+  }
+}
+
+async function ensureAdminProfileColumns(sequelize) {
+  const queryInterface = sequelize.getQueryInterface();
+  let columns;
+  try { columns = await queryInterface.describeTable('Admins'); }
+  catch { return; }
+  if (!columns.profileImageUrl) {
+    await queryInterface.addColumn('Admins', 'profileImageUrl', {
+      type: DataTypes.STRING,
+      allowNull: true,
+    });
+  }
+  if (!columns.profileImagePublicId) {
+    await queryInterface.addColumn('Admins', 'profileImagePublicId', {
+      type: DataTypes.STRING,
+      allowNull: true,
+    });
+  }
 }
 
 async function ensureNotificationOrderIdColumn(sequelize) {
@@ -47,4 +78,4 @@ async function ensureNotificationOrderIdColumn(sequelize) {
   }
 }
 
-module.exports = { ensureCustomerProfileColumns, ensureOrderWorkflowColumns, ensureNotificationOrderIdColumn };
+module.exports = { ensureAdminProfileColumns, ensureCustomerProfileColumns, ensureOrderWorkflowColumns, ensureNotificationOrderIdColumn };

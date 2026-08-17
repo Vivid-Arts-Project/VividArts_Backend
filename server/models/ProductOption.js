@@ -44,7 +44,7 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.BOOLEAN,
       defaultValue: false,
     },
-    // Deadline set by customer when is_urgent = true (minimum 7 days from order date)
+    // Deadline set by customer when is_urgent = true (within the next 7 days)
     urgent_deadline: {
       type: DataTypes.DATEONLY,
       allowNull: true,

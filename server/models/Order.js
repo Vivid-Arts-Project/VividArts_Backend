@@ -91,6 +91,14 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.DATE,
       allowNull: true,
     },
+    sketching_started_at: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+    estimated_completion_at: {
+      type: DataTypes.DATEONLY,
+      allowNull: true,
+    },
   }, {
     tableName: 'Orders',
     timestamps: true,   // adds createdAt (= order placed date) and updatedAt
