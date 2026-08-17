@@ -2,6 +2,7 @@ const express = require('express');
 const router  = express.Router();
 const db      = require('../models');
 const { createAdminNotification } = require('../utils/adminNotificationHelper');
+const { uploadProfile, uploadProfileImage, deleteImage } = require('../middleware/upload');
 
 // ── POST /api/admin/register ──────────────────────────────────────────────────
 // Creates a new admin account and stores it in the Admins table.
@@ -113,6 +114,28 @@ router.patch('/profile', requireAdmin, async (req, res) => {
     await admin.update({ firstName, lastName, email, phone });
     res.json({ message: 'Profile updated', admin: safeAdmin(admin) });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.patch('/profile/image', requireAdmin, (req, res) => {
+  uploadProfile(req, res, async uploadError => {
+    if (uploadError) return res.status(400).json({ error: uploadError.message });
+    if (!req.file) return res.status(400).json({ error: 'Select a JPG, PNG, or WebP image' });
+
+    try {
+      const admin = await db.Admin.findByPk(req.session.adminId);
+      if (!admin) return res.status(404).json({ error: 'Admin not found' });
+      const previousPublicId = admin.profileImagePublicId;
+      const uploaded = await uploadProfileImage(req.file, `admin_${admin.id}`);
+      await admin.update({
+        profileImageUrl: uploaded.url,
+        profileImagePublicId: uploaded.publicId,
+      });
+      if (previousPublicId) deleteImage(previousPublicId).catch(() => {});
+      res.json({ message: 'Profile photo updated', admin: safeAdmin(admin) });
+    } catch (error) {
+      res.status(500).json({ error: error.message || 'Unable to update profile photo' });
+    }
+  });
 });
 
 // ── PATCH /api/admin/business ─────────────────────────────────────────────────

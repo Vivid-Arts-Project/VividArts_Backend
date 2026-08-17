@@ -49,7 +49,7 @@ const adminAuthRouter = require('./routes/adminAuth');  // login, register, /me
 const adminRouter     = require('./routes/admin');       // orders, proofs, pricing
 const ordersRouter = require('./routes/orders');
 const contentRouter = require('./routes/content');
-const { ensureCustomerProfileColumns, ensureOrderWorkflowColumns, ensureNotificationOrderIdColumn } = require('./utils/schema');
+const { ensureAdminProfileColumns, ensureCustomerProfileColumns, ensureOrderWorkflowColumns, ensureNotificationOrderIdColumn } = require('./utils/schema');
 const { ensurePriceCatalog } = require('./utils/pricing');
 
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
@@ -65,6 +65,7 @@ app.use('/api/content', contentRouter);
 db.sequelize.authenticate()
   .then(async () => {
     await ensureCustomerProfileColumns(db.sequelize);
+    await ensureAdminProfileColumns(db.sequelize);
     await ensureOrderWorkflowColumns(db.sequelize);
     await ensureNotificationOrderIdColumn(db.sequelize);
     await ensurePriceCatalog();

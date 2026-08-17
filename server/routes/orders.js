@@ -41,6 +41,8 @@ router.get('/my-orders', protect, async (req, res) => {
         workflowStatus: order.status,
         createdAt: order.createdAt,
         updatedAt: order.updatedAt,
+        sketchingStartedAt: order.sketching_started_at,
+        estimatedCompletionAt: order.estimated_completion_at,
         completedAt: order.completed_at,
         approvedAt: order.approved_at,
         paperSize: product.paper_size,

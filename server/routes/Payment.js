@@ -9,6 +9,7 @@ const { getCatalog, calculateOrder } = require('../utils/pricing');
 const { JWT_SECRET } = require('../config/auth');
 const { uploadReferences, deleteImage } = require('../middleware/upload');
 const { createAdminNotification } = require('../utils/adminNotificationHelper');
+const { ACTIVE_STATUSES, buildTimelinePreview } = require('../utils/scheduling');
 
 const requireAdmin = (req, res, next) => {
   if (!req.session?.adminId) return res.status(401).json({ error: 'Unauthorized' });
@@ -77,9 +78,39 @@ const PAYHERE_ALLOWED_CURRENCIES = (process.env.PAYHERE_ALLOWED_CURRENCIES || 'L
 
 const createOrderId = () => `ORD-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
+const URGENT_ORDER_LIMIT = 2;
+const URGENT_WINDOW_DAYS = 10;
+
+const getUrgentAvailability = async (transaction) => {
+  const windowStart = new Date();
+  windowStart.setDate(windowStart.getDate() - URGENT_WINDOW_DAYS);
+  const accepted = await db.Order.count({
+    where: { is_urgent: true, createdAt: { [db.Sequelize.Op.gte]: windowStart } },
+    transaction,
+  });
+  return {
+    limit: URGENT_ORDER_LIMIT,
+    windowDays: URGENT_WINDOW_DAYS,
+    accepted,
+    remaining: Math.max(0, URGENT_ORDER_LIMIT - accepted),
+  };
+};
+
+const assertUrgentAvailability = async (computedOrder, transaction) => {
+  if (!computedOrder.urgent) return;
+  const availability = await getUrgentAvailability(transaction);
+  if (availability.remaining === 0) {
+    const error = new Error('Urgent-order capacity is currently full. Only 2 urgent orders can be accepted in each 10-day period. Please choose a standard order or contact us for the next available urgent date.');
+    error.statusCode = 409;
+    error.code = 'URGENT_CAPACITY_FULL';
+    throw error;
+  }
+};
+
 const createCommission = async (req, computedOrder, payment) => {
   const customerId = req.customerId;
   return db.sequelize.transaction(async transaction => {
+    await assertUrgentAvailability(computedOrder, transaction);
     const product = await db.ProductOption.create({
       paper_size: computedOrder.sizeId, num_subjects: computedOrder.people,
       frame_type: computedOrder.frameId === 'none' ? 'without_frame' : computedOrder.frameId === 'premium' ? 'wooden_frame' : 'plastic_frame',
@@ -213,6 +244,7 @@ router.post('/create-order', requireCustomer, async (req, res) => {
   try {
     const { currency, paymentMethod, bankDetails, order } = req.body;
     const computedOrder = await calculateOrder(order);
+    await assertUrgentAvailability(computedOrder);
 
     const orderData = {
       payhereOrderId: createOrderId(),
@@ -248,9 +280,10 @@ router.post('/create-order', requireCustomer, async (req, res) => {
     });
   } catch (error) {
     console.error('Error creating order:', error);
-    res.status(500).json({
+    res.status(error.statusCode || 500).json({
       success: false,
-      error: 'Failed to create order'
+      error: error.statusCode ? error.message : 'Failed to create order',
+      code: error.code,
     });
   }
 });
@@ -276,6 +309,7 @@ router.post('/create-payhere-checkout', requireCustomer, async (req, res) => {
     }
 
     const computedOrder = await calculateOrder(order);
+    await assertUrgentAvailability(computedOrder);
     const gatewayAmount = calculateDisplayAmount(computedOrder.dueAmount, selectedCurrency);
 
     const payment = await Payment.create({
@@ -349,10 +383,40 @@ router.post('/create-payhere-checkout', requireCustomer, async (req, res) => {
     });
   } catch (error) {
     console.error('Error creating PayHere checkout:', error);
-    res.status(500).json({
+    res.status(error.statusCode || 500).json({
       success: false,
-      error: 'Failed to create PayHere checkout'
+      error: error.statusCode ? error.message : 'Failed to create PayHere checkout',
+      code: error.code,
     });
+  }
+});
+
+router.post('/timeline-preview', requireCustomer, async (req, res) => {
+  try {
+    const orders = await db.Order.findAll({
+      where: { status: { [db.Sequelize.Op.in]: ACTIVE_STATUSES } },
+      include: [{ model: db.ProductOption, as: 'productOption' }],
+    });
+    const proposedOrder = {
+      urgent: req.body?.urgent === true,
+      urgentDeadline: req.body?.urgentDeadline || null,
+      people: req.body?.people,
+      deliveryMethod: req.body?.deliveryMethod === 'pickup' ? 'pickup' : 'courier',
+    };
+    res.json({ success: true, timeline: buildTimelinePreview(orders, proposedOrder) });
+  } catch (error) {
+    console.error('Error calculating timeline preview:', error);
+    res.status(500).json({ success: false, error: 'Failed to calculate the estimated timeline' });
+  }
+});
+
+router.get('/urgent-availability', async (_req, res) => {
+  try {
+    const availability = await getUrgentAvailability();
+    res.json({ success: true, ...availability, available: availability.remaining > 0 });
+  } catch (error) {
+    console.error('Error fetching urgent-order availability:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch urgent-order availability' });
   }
 });
 
