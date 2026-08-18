@@ -49,7 +49,7 @@ const adminAuthRouter = require('./routes/adminAuth');  // login, register, /me
 const adminRouter     = require('./routes/admin');       // orders, proofs, pricing
 const ordersRouter = require('./routes/orders');
 const contentRouter = require('./routes/content');
-const { ensureAdminProfileColumns, ensureCustomerProfileColumns, ensureOrderWorkflowColumns, ensureNotificationOrderIdColumn } = require('./utils/schema');
+const { ensureAdminProfileColumns, removeDuplicateUniqueIndexes, ensureCustomerProfileColumns, ensureOrderWorkflowColumns, ensureNotificationOrderIdColumn } = require('./utils/schema');
 const { ensurePriceCatalog } = require('./utils/pricing');
 
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
@@ -64,14 +64,18 @@ app.use('/api/content', contentRouter);
 // Create any missing tables once on startup without resetting existing data.
 db.sequelize.authenticate()
   .then(async () => {
+    await removeDuplicateUniqueIndexes(db.sequelize);
     await ensureCustomerProfileColumns(db.sequelize);
     await ensureAdminProfileColumns(db.sequelize);
     await ensureOrderWorkflowColumns(db.sequelize);
     await ensureNotificationOrderIdColumn(db.sequelize);
     await ensurePriceCatalog();
-    // Create any missing model tables without dropping or altering existing data.
-    // This includes the payment and order workflow tables required before PayHere checkout.
-    await db.sequelize.sync({ alter: false });
+    // Sync models individually. A global Sequelize sync detects the project's
+    // cyclic associations and silently performs a second `alter: true` pass,
+    // which repeatedly creates MySQL UNIQUE indexes on every restart.
+    for (const model of Object.values(db.sequelize.models)) {
+      await model.sync({ withoutForeignKeyConstraints: true });
+    }
     app.listen(port, () => console.log(`✓ Server running on http://localhost:${port}`));
   })
   .catch(err => console.error('✗ DB connection failed:', err));

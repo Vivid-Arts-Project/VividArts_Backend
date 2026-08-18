@@ -10,6 +10,37 @@ const { createNotification } = require('../utils/notificationHelper');
 const { createAdminNotification } = require('../utils/adminNotificationHelper');
 const { calculateCompletionFromSketchingStart, sortProductionQueue } = require('../utils/scheduling');
 
+const ensureUrgentDeadlineNotifications = async () => {
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const deadline = `${tomorrow.getFullYear()}-${String(tomorrow.getMonth() + 1).padStart(2, '0')}-${String(tomorrow.getDate()).padStart(2, '0')}`;
+  const urgentOrders = await db.Order.findAll({
+    where: { status: { [db.Sequelize.Op.notIn]: ['done'] } },
+    include: [{
+      model: db.ProductOption,
+      as: 'productOption',
+      required: true,
+      where: { is_urgent: true, urgent_deadline: deadline },
+    }],
+  });
+  if (!urgentOrders.length) return;
+  const admins = await db.Admin.findAll({ attributes: ['id'] });
+  await Promise.all(admins.flatMap(admin => urgentOrders.map(async order => {
+    const exists = await db.AdminNotification.findOne({ where: {
+      admin_id: admin.id,
+      order_id: order.order_id,
+      type: 'urgent_deadline',
+    } });
+    if (!exists) await createAdminNotification({
+      adminId: admin.id,
+      orderId: order.order_id,
+      type: 'urgent_deadline',
+      title: 'Urgent order due tomorrow',
+      message: `Urgent order #${order.order_id.slice(0, 8)} is due tomorrow (${deadline}).`,
+    });
+  })));
+};
+
 const orderJson = (instance) => {
   const o = typeof instance?.toJSON === 'function' ? instance.toJSON() : instance;
   if (!o) return null;
@@ -20,11 +51,12 @@ const orderJson = (instance) => {
     phone: o.customer.phone_number,
   } : null;
   const completedPaid = (o.payments || []).filter(payment => payment.status === 'completed').reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
+  const checkoutDetails = ((o.payments || []).find(payment => payment.metadata?.order)?.metadata?.order) || {};
   return { ...o, customer, id: o.order_id, customerId: o.customer_id, totalPrice: o.calculated_price,
     amountPaid: completedPaid || Number(o.amount_paid || 0), paymentType: o.payment_type, isUrgent: o.is_urgent,
     artistLocation: o.artist_location, paperSize: p.paper_size,
     subjectCount: p.num_subjects ? `${p.num_subjects}_subjects` : null,
-    frameType: p.frame_type, pickupOption: p.pickup_option, urgentDeadline: p.urgent_deadline,
+    frameType: p.frame_type, pickupOption: p.pickup_option, deliveryAddress: checkoutDetails.deliveryAddress || null, urgentDeadline: p.urgent_deadline,
     customerNote: p.customer_note,
     referencePhotos: (o.referencePhotos || []).map(photo => photo.cloudinary_url),
     proofImagePath: o.proofImages?.find(proof => proof.is_current)?.cloudinary_url || null,
@@ -76,6 +108,7 @@ const requireAdmin = (req, res, next) => {
 
 router.get('/activity-notifications', requireAdmin, async (req, res) => {
   try {
+    await ensureUrgentDeadlineNotifications();
     const notifications = await db.AdminNotification.findAll({
       where: { admin_id: req.session.adminId },
       order: [['createdAt', 'DESC']],
@@ -204,6 +237,7 @@ router.post('/pricing/calculate', async (req, res) => {
 
 router.get('/orders', requireAdmin, async (req, res) => {
   try {
+    await ensureUrgentDeadlineNotifications();
     const orders = await db.Order.findAll({
       include: [{ model: db.Customer, as: 'customer' }, { model: db.ProductOption, as: 'productOption' }, { model: db.ReferencePhoto, as: 'referencePhotos' }, { model: db.ProofImage, as: 'proofImages' }, { model: db.Payment, as: 'payments' }, { model: db.Message, as: 'messages' }],
     });
