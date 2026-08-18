@@ -64,6 +64,37 @@ async function ensureAdminProfileColumns(sequelize) {
   }
 }
 
+async function removeDuplicateUniqueIndexes(sequelize) {
+  const queryInterface = sequelize.getQueryInterface();
+  for (const [tableName, columnNames] of Object.entries({
+    Admins: ['username', 'email'],
+    Customers: ['username', 'email'],
+  })) {
+    let indexes;
+    try { indexes = await queryInterface.showIndex(tableName); }
+    catch { continue; }
+
+    for (const columnName of columnNames) {
+      const matching = indexes.filter(index =>
+        index.unique
+        && index.name !== 'PRIMARY'
+        && index.fields?.length === 1
+        && (index.fields[0].attribute || index.fields[0].name) === columnName
+      );
+      if (matching.length <= 1) continue;
+      const keep = matching.find(index => index.name === columnName) || matching[0];
+      for (const index of matching) {
+        if (index.name === keep.name) continue;
+        try { await queryInterface.removeIndex(tableName, index.name); }
+        catch (error) {
+          // A second dev watcher may be running the same idempotent cleanup.
+          if (error.original?.code !== 'ER_CANT_DROP_FIELD_OR_KEY') throw error;
+        }
+      }
+    }
+  }
+}
+
 async function ensureNotificationOrderIdColumn(sequelize) {
   const queryInterface = sequelize.getQueryInterface();
   let columns;
@@ -78,4 +109,4 @@ async function ensureNotificationOrderIdColumn(sequelize) {
   }
 }
 
-module.exports = { ensureAdminProfileColumns, ensureCustomerProfileColumns, ensureOrderWorkflowColumns, ensureNotificationOrderIdColumn };
+module.exports = { ensureAdminProfileColumns, removeDuplicateUniqueIndexes, ensureCustomerProfileColumns, ensureOrderWorkflowColumns, ensureNotificationOrderIdColumn };
