@@ -1,7 +1,6 @@
-const ACTIVE_STATUSES = [
-  'in_queue', 'sketching', 'waiting_for_feedback', 'revision_requested',
-  'approved', 'finished', 'framed', 'shipped',
-];
+const { ORDER_STATUSES } = require('./orderWorkflow');
+
+const ACTIVE_STATUSES = [...ORDER_STATUSES.filter(status => status !== 'done'), 'finished'];
 
 const startOfToday = () => {
   const date = new Date();

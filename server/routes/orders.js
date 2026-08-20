@@ -4,10 +4,12 @@ const db = require('../models');
 const { Notification } = db;
 const { protect } = require('../middleware/authMiddleware');
 const { createAdminNotification } = require('../utils/adminNotificationHelper');
+const { paginationFrom, paginationMeta } = require('../utils/pagination');
 
 router.get('/my-orders', protect, async (req, res) => {
   try {
-    const orders = await db.Order.findAll({
+    const { page, limit, offset } = paginationFrom(req.query);
+    const { count, rows: orders } = await db.Order.findAndCountAll({
       where: { customer_id: req.user.customerId },
       include: [
         { model: db.ProductOption, as: 'productOption' },
@@ -22,8 +24,12 @@ router.get('/my-orders', protect, async (req, res) => {
         [{ model: db.ProofImage, as: 'proofImages' }, 'version', 'DESC'],
         [{ model: db.Message, as: 'messages' }, 'createdAt', 'ASC'],
       ],
+      distinct: true,
+      limit,
+      offset,
     });
 
+    res.set('X-Pagination', JSON.stringify(paginationMeta(count, page, limit)));
     res.json(orders.map(instance => {
       const order = instance.toJSON();
       const product = order.productOption || {};
@@ -141,12 +147,16 @@ router.post('/:id/proof-review', protect, async (req, res) => {
 router.get('/notifications', protect, async (req, res) => {
   try {
     const customerId = req.user.customerId;
+    const { page, limit, offset } = paginationFrom(req.query);
 
-    const notifications = await Notification.findAll({
+    const { count, rows: notifications } = await Notification.findAndCountAll({
       where: { customerId: customerId },
       order: [['createdAt', 'DESC']],
+      limit,
+      offset,
     });
 
+    res.set('X-Pagination', JSON.stringify(paginationMeta(count, page, limit)));
     res.json(notifications);
   } catch (error) {
     res.status(500).json({ message: 'Error fetching notifications', error: error.message });

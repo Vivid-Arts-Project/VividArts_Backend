@@ -9,6 +9,8 @@ const { calculatePrice, loadPrices }                = require('../middleware/pri
 const { createNotification } = require('../utils/notificationHelper');
 const { createAdminNotification } = require('../utils/adminNotificationHelper');
 const { calculateCompletionFromSketchingStart, sortProductionQueue } = require('../utils/scheduling');
+const { paginationFrom, paginationMeta } = require('../utils/pagination');
+const { ORDER_STATUSES, normalizeStatus, allowedTransitions, canTransition } = require('../utils/orderWorkflow');
 
 const ensureUrgentDeadlineNotifications = async () => {
   const tomorrow = new Date();
@@ -63,6 +65,7 @@ const orderJson = (instance) => {
     messages: [...(o.messages || [])]
       .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
       .map(m => ({ ...m, senderType: m.sender_type, message: m.message_text })),
+    allowedTransitions: allowedTransitions(o.status, p),
   };
 };
 
@@ -109,13 +112,21 @@ const requireAdmin = (req, res, next) => {
 router.get('/activity-notifications', requireAdmin, async (req, res) => {
   try {
     await ensureUrgentDeadlineNotifications();
-    const notifications = await db.AdminNotification.findAll({
-      where: { admin_id: req.session.adminId },
-      order: [['createdAt', 'DESC']],
-    });
+    const { page, limit, offset } = paginationFrom(req.query);
+    const [result, unreadCount] = await Promise.all([
+      db.AdminNotification.findAndCountAll({
+        where: { admin_id: req.session.adminId },
+        order: [['createdAt', 'DESC']],
+        limit,
+        offset,
+      }),
+      db.AdminNotification.count({ where: { admin_id: req.session.adminId, is_read: false } }),
+    ]);
+    const { count, rows: notifications } = result;
     res.json({
       notifications,
-      unreadCount: notifications.filter(notification => !notification.is_read).length,
+      unreadCount,
+      pagination: paginationMeta(count, page, limit),
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -238,35 +249,54 @@ router.post('/pricing/calculate', async (req, res) => {
 router.get('/orders', requireAdmin, async (req, res) => {
   try {
     await ensureUrgentDeadlineNotifications();
-    const orders = await db.Order.findAll({
-      include: [{ model: db.Customer, as: 'customer' }, { model: db.ProductOption, as: 'productOption' }, { model: db.ReferencePhoto, as: 'referencePhotos' }, { model: db.ProofImage, as: 'proofImages' }, { model: db.Payment, as: 'payments' }, { model: db.Message, as: 'messages' }],
+    const { page, limit, offset } = paginationFrom(req.query);
+    const queueRows = await db.Order.findAll({
+      attributes: ['order_id', 'status', 'is_urgent', 'calculated_price', 'amount_paid', 'createdAt'],
+      include: [{ model: db.ProductOption, as: 'productOption', attributes: ['urgent_deadline', 'num_subjects'] }],
     });
     const stats = {
-      total:           orders.filter(o => o.status !== 'done').length,
-      inQueue:         orders.filter(o => o.status === 'in_queue').length,
-      sketching:       orders.filter(o => o.status === 'sketching').length,
-      urgentActive:    orders.filter(o => o.isUrgent && o.status !== 'done').length,
-      waitingFeedback: orders.filter(o => o.status === 'waiting_for_feedback').length,
-      revisionRequested: orders.filter(o => o.status === 'revision_requested').length,
-      approved:        orders.filter(o => ['approved', 'finished'].includes(o.status)).length,
-      totalValue:      orders.reduce((sum, o) => sum + Number(o.calculated_price || 0), 0),
-      totalCollected:  orders.reduce((sum, o) => sum + Number(o.amount_paid || 0), 0),
+      total:           queueRows.filter(o => o.status !== 'done').length,
+      inQueue:         queueRows.filter(o => o.status === 'in_queue').length,
+      sketching:       queueRows.filter(o => o.status === 'sketching').length,
+      urgentActive:    queueRows.filter(o => o.is_urgent && o.status !== 'done').length,
+      waitingFeedback: queueRows.filter(o => o.status === 'waiting_for_feedback').length,
+      revisionRequested: queueRows.filter(o => o.status === 'revision_requested').length,
+      approved:        queueRows.filter(o => ['approved', 'finished'].includes(o.status)).length,
+      totalValue:      queueRows.reduce((sum, o) => sum + Number(o.calculated_price || 0), 0),
+      totalCollected:  queueRows.reduce((sum, o) => sum + Number(o.amount_paid || 0), 0),
     };
-    res.json({ orders: sortProductionQueue(orders).map(orderJson), stats });
+    const orderedIds = sortProductionQueue(queueRows).slice(offset, offset + limit).map(order => order.order_id);
+    const pageRows = orderedIds.length ? await db.Order.findAll({
+      where: { order_id: orderedIds },
+      include: [
+        { model: db.Customer, as: 'customer', attributes: ['customer_id', 'username', 'full_name', 'email', 'phone_number'] },
+        { model: db.ProductOption, as: 'productOption' },
+        { model: db.Payment, as: 'payments', attributes: ['paymentId', 'amount', 'status', 'currency', 'createdAt'] },
+        { model: db.Message, as: 'messages', attributes: ['message_id', 'sender_type', 'message_text', 'createdAt'], separate: true, limit: 1, order: [['createdAt', 'DESC']] },
+      ],
+    }) : [];
+    const byId = new Map(pageRows.map(order => [order.order_id, order]));
+    const orders = orderedIds.map(id => byId.get(id)).filter(Boolean).map(orderJson);
+    res.json({ orders, stats, pagination: paginationMeta(queueRows.length, page, limit) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 router.get('/customers', requireAdmin, async (req, res) => {
   try {
-    const customers = await db.Customer.findAll({
+    const { page, limit, offset } = paginationFrom(req.query);
+    const { count, rows: customers } = await db.Customer.findAndCountAll({
+      attributes: ['customer_id', 'username', 'full_name', 'email', 'phone_number', 'address', 'profile_image_url', 'createdAt'],
       include: [{
         model: db.Order,
         as: 'orders',
-        include: [{ model: db.ProductOption, as: 'productOption' }, { model: db.Payment, as: 'payments' }],
+        attributes: ['order_id', 'currency', 'calculated_price', 'amount_paid', 'status', 'createdAt'],
       }],
       order: [['createdAt', 'DESC']],
+      distinct: true,
+      limit,
+      offset,
     });
-    res.json({ customers: customers.map(customerJson) });
+    res.json({ customers: customers.map(customerJson), pagination: paginationMeta(count, page, limit) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -362,8 +392,7 @@ router.delete('/orders/:id', requireAdmin, async (req, res) => {
 router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
   try {
     const { status, customMessage } = req.body;
-    const valid = ['in_queue','sketching','waiting_for_feedback','revision_requested','approved','finished','framed','shipped','done'];
-    if (!valid.includes(status)) return res.status(400).json({ error: 'Invalid status' });
+    if (!ORDER_STATUSES.includes(normalizeStatus(status))) return res.status(400).json({ error: 'Invalid status' });
 
     const order = await db.Order.findByPk(req.params.id, {
       include: [{ model: db.Customer, as: 'customer' }],
@@ -371,19 +400,8 @@ router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
     const product = await order.getProductOption();
-    const current = order.status === 'finished' ? 'approved' : order.status;
-    const requested = status === 'finished' ? 'approved' : status;
-    const allowedNext = {
-      in_queue: ['in_queue', 'sketching'],
-      sketching: ['sketching'],
-      waiting_for_feedback: ['waiting_for_feedback'],
-      revision_requested: ['revision_requested'],
-      approved: ['approved', ...(product?.frame_type && product.frame_type !== 'without_frame' ? ['framed'] : product?.pickup_option === 'courier' ? ['shipped'] : ['done'])],
-      framed: ['framed', ...(product?.pickup_option === 'courier' ? ['shipped'] : ['done'])],
-      shipped: ['shipped', 'done'],
-      done: ['done'],
-    };
-    if (!allowedNext[current]?.includes(requested)) {
+    const requested = normalizeStatus(status);
+    if (!canTransition(order.status, requested, product)) {
       return res.status(400).json({ error: 'This status change is not available at the current workflow stage' });
     }
     if (status === 'framed' && (!product?.frame_type || product.frame_type === 'without_frame')) {

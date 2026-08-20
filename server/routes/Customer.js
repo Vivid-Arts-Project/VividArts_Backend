@@ -1,11 +1,13 @@
 const express = require('express');
 const router = express.Router();
+const { paginationFrom, paginationMeta } = require('../utils/pagination');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { Customer, Notification } = require('../models');
 const { Op } = require('sequelize');
 const { sendEmail } = require('../middleware/email');
+const { protect } = require('../middleware/authMiddleware');
 
 const { uploadProfile, uploadProfileImage, uploadCover, deleteImage } = require('../middleware/upload');
 const { JWT_SECRET } = require('../config/auth');
@@ -21,12 +23,12 @@ const createToken = (customer) => jwt.sign(
   JWT_SECRET,
   { expiresIn: '8h' }
 );
-const decodeToken = (token) => {
-  try {
-    return jwt.verify(token, JWT_SECRET);
-  } catch {
-    return null;
-  }
+const customerCookieOptions = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'strict',
+  maxAge: 8 * 60 * 60 * 1000,
+  path: '/',
 };
 
 // 📧 1. SEND OTP TO EMAIL ROUTE
@@ -191,9 +193,9 @@ router.post('/login', async (req, res) => {
     }
 
     const token = createToken(customer);
+    res.cookie('vividarts.customer.token', token, customerCookieOptions);
     res.json({
       message: 'Login successful.',
-      token,
       customer: {
         customer_id: customer.customer_id,
         username: customer.username,
@@ -206,22 +208,20 @@ router.post('/login', async (req, res) => {
   }
 });
 
+router.post('/logout', (_req, res) => {
+  res.clearCookie('vividarts.customer.token', {
+    httpOnly: true,
+    secure: customerCookieOptions.secure,
+    sameSite: customerCookieOptions.sameSite,
+    path: '/',
+  });
+  res.json({ message: 'Logged out.' });
+});
+
 // 👤 PROFILE ROUTES
-router.get('/profile', async (req, res) => {
+router.get('/profile', protect, async (req, res) => {
   try {
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-
-    if (!token) {
-      return res.status(401).json({ message: 'Authentication token missing.' });
-    }
-
-    const decoded = decodeToken(token);
-    if (!decoded || !decoded.customerId) {
-      return res.status(401).json({ message: 'Invalid authentication token.' });
-    }
-
-    const customer = await Customer.findByPk(decoded.customerId);
+    const customer = await Customer.findByPk(req.user.customerId);
     if (!customer) {
       return res.status(404).json({ message: 'Customer not found.' });
     }
@@ -242,22 +242,15 @@ router.get('/profile', async (req, res) => {
   }
 });
 
-router.post('/profile/avatar', async (req, res) => {
+router.post('/profile/avatar', protect, async (req, res) => {
   try {
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-    if (!token) return res.status(401).json({ message: 'Authentication token missing.' });
-
-    const decoded = decodeToken(token);
-    if (!decoded || !decoded.customerId) return res.status(401).json({ message: 'Invalid authentication token.' });
-
-    req.decodedCustomerId = decoded.customerId;
+    req.decodedCustomerId = req.user.customerId;
 
     uploadProfile(req, res, async (err) => {
       if (err) return res.status(400).json({ message: err.message || 'Upload failed.' });
       if (!req.file) return res.status(400).json({ message: 'No file uploaded.' });
 
-      const customer = await Customer.findByPk(decoded.customerId);
+      const customer = await Customer.findByPk(req.user.customerId);
       if (!customer) return res.status(404).json({ message: 'Customer not found.' });
 
       const previousPublicId = customer.profile_image_public_id;
@@ -276,22 +269,15 @@ router.post('/profile/avatar', async (req, res) => {
   }
 });
 
-router.post('/profile/cover', async (req, res) => {
+router.post('/profile/cover', protect, async (req, res) => {
   try {
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-    if (!token) return res.status(401).json({ message: 'Authentication token missing.' });
-
-    const decoded = decodeToken(token);
-    if (!decoded || !decoded.customerId) return res.status(401).json({ message: 'Invalid authentication token.' });
-
-    req.decodedCustomerId = decoded.customerId;
+    req.decodedCustomerId = req.user.customerId;
 
     uploadCover(req, res, async (err) => {
       if (err) return res.status(400).json({ message: err.message || 'Upload failed.' });
       if (!req.file) return res.status(400).json({ message: 'No file uploaded.' });
 
-      const customer = await Customer.findByPk(decoded.customerId);
+      const customer = await Customer.findByPk(req.user.customerId);
       if (!customer) return res.status(404).json({ message: 'Customer not found.' });
 
       const previousPublicId = customer.cover_image_public_id;
@@ -309,21 +295,9 @@ router.post('/profile/cover', async (req, res) => {
   }
 });
 
-router.put('/profile', async (req, res) => {
+router.put('/profile', protect, async (req, res) => {
   try {
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-
-    if (!token) {
-      return res.status(401).json({ message: 'Authentication token missing.' });
-    }
-
-    const decoded = decodeToken(token);
-    if (!decoded || !decoded.customerId) {
-      return res.status(401).json({ message: 'Invalid authentication token.' });
-    }
-
-    const customer = await Customer.findByPk(decoded.customerId);
+    const customer = await Customer.findByPk(req.user.customerId);
     if (!customer) {
       return res.status(404).json({ message: 'Customer not found.' });
     }
@@ -353,51 +327,31 @@ router.put('/profile', async (req, res) => {
 });
 
 // 🔔 NOTIFICATIONS APIS
-router.get('/notifications', async (req, res) => {
+router.get('/notifications', protect, async (req, res) => {
   try {
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-
-    if (!token) {
-      return res.status(401).json({ message: 'Authentication token missing.' });
-    }
-
-    const decoded = decodeToken(token);
-    if (!decoded || !decoded.customerId) {
-      return res.status(401).json({ message: 'Invalid authentication token.' });
-    }
-
-    const notifications = await Notification.findAll({
-      where: { customerId: decoded.customerId },
-      order: [['createdAt', 'DESC']]
+    const { page, limit, offset } = paginationFrom(req.query);
+    const { count, rows: notifications } = await Notification.findAndCountAll({
+      where: { customerId: req.user.customerId },
+      order: [['createdAt', 'DESC']],
+      limit,
+      offset,
     });
 
     res.json({
       success: true,
       notifications,
+      pagination: paginationMeta(count, page, limit),
     });
   } catch (error) {
     res.status(500).json({ message: error.message || 'Failed to fetch notifications.' });
   }
 });
 
-router.put('/notifications/:id/read', async (req, res) => {
+router.put('/notifications/:id/read', protect, async (req, res) => {
   try {
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-
-    if (!token) {
-      return res.status(401).json({ message: 'Authentication token missing.' });
-    }
-
-    const decoded = decodeToken(token);
-    if (!decoded || !decoded.customerId) {
-      return res.status(401).json({ message: 'Invalid authentication token.' });
-    }
-
     const updated = await Notification.update(
       { isRead: true },
-      { where: { id: req.params.id, customerId: decoded.customerId } },
+      { where: { id: req.params.id, customerId: req.user.customerId } },
     );
     if (!updated[0]) return res.status(404).json({ message: 'Notification not found.' });
 

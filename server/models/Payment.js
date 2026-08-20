@@ -47,6 +47,7 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.ENUM('pending', 'completed', 'failed'),
       defaultValue: 'pending',
     },
+    completedAt: { type: DataTypes.DATE, allowNull: true },
 
     transactionId:    { type: DataTypes.STRING, allowNull: true },
     payherePaymentId: { type: DataTypes.STRING, allowNull: true },
@@ -59,6 +60,7 @@ module.exports = (sequelize, DataTypes) => {
   }, {
     tableName: 'Payments',
     timestamps: true,
+    indexes: [{ unique: true, fields: ['order_id', 'paymentType'], name: 'payments_order_purpose_unique' }],
   });
 
   // ── Associations ─────────────────────────────────────────────────────────────
