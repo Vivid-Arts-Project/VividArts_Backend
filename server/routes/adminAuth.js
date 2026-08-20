@@ -3,13 +3,18 @@ const router  = express.Router();
 const db      = require('../models');
 const { createAdminNotification } = require('../utils/adminNotificationHelper');
 const { uploadProfile, uploadProfileImage, deleteImage } = require('../middleware/upload');
+const adminLoginLimiter = require('../middleware/adminLoginLimiter');
 
 // ── POST /api/admin/register ──────────────────────────────────────────────────
-// Creates a new admin account and stores it in the Admins table.
-// In production you would restrict this endpoint (e.g. only allow if zero admins exist,
-// or protect it with a secret registration token).
+// The first administrator bootstraps the system. Once one exists, only an
+// authenticated administrator can create another account.
 router.post('/register', async (req, res) => {
   try {
+    const adminCount = await db.Admin.count();
+    if (adminCount > 0 && !req.session?.adminId) {
+      return res.status(403).json({ error: 'Administrator registration requires an existing admin session' });
+    }
+
     const { username, password, firstName, lastName, email, phone } = req.body;
 
     if (!username || !password || !email) {
@@ -38,8 +43,10 @@ router.post('/register', async (req, res) => {
       phone:        phone || null,
     });
 
-    // Log in automatically after registering
+    // Rotate the session identifier before granting administrator access.
+    await regenerateSession(req);
     req.session.adminId = admin.id;
+    await saveSession(req);
     await createAdminNotification({
       adminId: admin.id,
       type: 'system',
@@ -57,7 +64,7 @@ router.post('/register', async (req, res) => {
 });
 
 // ── POST /api/admin/login ─────────────────────────────────────────────────────
-router.post('/login', async (req, res) => {
+router.post('/login', adminLoginLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) {
@@ -66,10 +73,14 @@ router.post('/login', async (req, res) => {
 
     const admin = await db.Admin.findOne({ where: { username } });
     if (!admin || !(await admin.checkPassword(password))) {
+      req.adminLoginAttempt.failed();
       return res.status(401).json({ error: 'Invalid username or password' });
     }
 
+    req.adminLoginAttempt.succeeded();
+    await regenerateSession(req);
     req.session.adminId = admin.id;
+    await saveSession(req);
     await createAdminNotification({
       adminId: admin.id,
       type: 'system',
@@ -84,7 +95,10 @@ router.post('/login', async (req, res) => {
 
 // ── POST /api/admin/logout ────────────────────────────────────────────────────
 router.post('/logout', (req, res) => {
-  req.session.destroy(() => res.json({ message: 'Logged out' }));
+  req.session.destroy(() => {
+    res.clearCookie('vividarts.admin.sid');
+    res.json({ message: 'Logged out' });
+  });
 });
 
 // ── GET /api/admin/me ─────────────────────────────────────────────────────────
@@ -173,6 +187,14 @@ function requireAdmin(req, res, next) {
 function safeAdmin(admin) {
   const { passwordHash, ...safe } = admin.toJSON();
   return safe;
+}
+
+function regenerateSession(req) {
+  return new Promise((resolve, reject) => req.session.regenerate(error => error ? reject(error) : resolve()));
+}
+
+function saveSession(req) {
+  return new Promise((resolve, reject) => req.session.save(error => error ? reject(error) : resolve()));
 }
 
 module.exports = router;

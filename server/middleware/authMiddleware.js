@@ -1,15 +1,24 @@
 const jwt = require('jsonwebtoken');
 const { JWT_SECRET } = require('../config/auth');
 
+function cookieValue(req, name) {
+  const cookie = req.headers.cookie || '';
+  const prefix = `${encodeURIComponent(name)}=`;
+  const part = cookie.split(';').map(value => value.trim()).find(value => value.startsWith(prefix));
+  return part ? decodeURIComponent(part.slice(prefix.length)) : '';
+}
+
 const protect = (req, res, next) => {
   let token;
 
-  // Check for token in the Authorization header (Format: Bearer <token>)
-  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
+  const bearer = req.headers.authorization?.startsWith('Bearer ')
+    ? req.headers.authorization.slice(7)
+    : '';
+  token = cookieValue(req, 'vividarts.customer.token') || bearer;
+
+  if (token) {
     try {
       // Extract token from string
-      token = req.headers.authorization.split(' ')[1];
-
       // Verify token using secret key
       const decoded = jwt.verify(token, JWT_SECRET);
 
@@ -28,4 +37,4 @@ const protect = (req, res, next) => {
   }
 };
 
-module.exports = { protect };
+module.exports = { protect, cookieValue };

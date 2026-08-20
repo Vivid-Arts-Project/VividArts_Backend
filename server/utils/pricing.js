@@ -19,7 +19,6 @@ let catalogReadyPromise;
 async function ensurePriceCatalog() {
   if (!catalogReadyPromise) {
     catalogReadyPromise = (async () => {
-      await db.PriceConfig.sync();
       for (const row of DEFAULT_PRICE_ROWS) {
         await db.PriceConfig.findOrCreate({ where: { itemKey: row.itemKey }, defaults: { ...row, isActive: true } });
       }

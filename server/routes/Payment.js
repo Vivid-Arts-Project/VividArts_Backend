@@ -1,15 +1,16 @@
 const express = require('express');
 const crypto = require('crypto');
-const jwt = require('jsonwebtoken');
 const router = express.Router();
+const { paginationFrom, paginationMeta } = require('../utils/pagination');
 const db = require('../models');
 const { Payment } = db;
 const { ensureInvoiceGenerated } = require('../utils/invoice');
 const { getCatalog, calculateOrder } = require('../utils/pricing');
-const { JWT_SECRET } = require('../config/auth');
+const { protect } = require('../middleware/authMiddleware');
 const { uploadReferences, deleteImage } = require('../middleware/upload');
 const { createAdminNotification } = require('../utils/adminNotificationHelper');
 const { ACTIVE_STATUSES, buildTimelinePreview } = require('../utils/scheduling');
+const { balanceCheckoutDecision, paymentCallbackDecision, paymentSummary } = require('../utils/paymentRules');
 
 const requireAdmin = (req, res, next) => {
   if (!req.session?.adminId) return res.status(401).json({ error: 'Unauthorized' });
@@ -17,15 +18,10 @@ const requireAdmin = (req, res, next) => {
 };
 
 const requireCustomer = (req, res, next) => {
-  try {
-    const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-    const decoded = jwt.verify(token, JWT_SECRET);
-    if (!decoded.customerId) return res.status(401).json({ success: false, error: 'Unauthorized' });
-    req.customerId = decoded.customerId;
+  protect(req, res, () => {
+    req.customerId = req.user.customerId;
     next();
-  } catch {
-    res.status(401).json({ success: false, error: 'Unauthorized' });
-  }
+  });
 };
 
 const requirePaymentViewer = (req, res, next) => {
@@ -426,31 +422,64 @@ router.post('/orders/:id/balance-checkout', requireCustomer, async (req, res) =>
     const configError = validatePayhereConfig();
     if (configError) return res.status(500).json({ success: false, error: configError });
 
-    const order = await db.Order.findOne({
-      where: { order_id: req.params.id, customer_id: req.customerId },
-      include: [{ model: db.Customer, as: 'customer' }],
+    const newPayhereOrderId = createOrderId();
+    const checkout = await db.sequelize.transaction(async transaction => {
+      const order = await db.Order.findOne({
+        where: { order_id: req.params.id, customer_id: req.customerId },
+        include: [{ model: db.Customer, as: 'customer' }],
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+      });
+      if (!order) {
+        const error = new Error('Order not found');
+        error.statusCode = 404;
+        throw error;
+      }
+      const payments = await Payment.findAll({
+        where: { order_id: order.order_id },
+        order: [['paymentId', 'ASC']],
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+      });
+      const decision = balanceCheckoutDecision({
+        orderStatus: order.status,
+        total: order.calculated_price,
+        payments,
+      });
+      const currency = order.currency || 'LKR';
+      if (!PAYHERE_ALLOWED_CURRENCIES.includes(currency)) {
+        const error = new Error(`PayHere is not configured for ${currency}`);
+        error.statusCode = 400;
+        throw error;
+      }
+      let payment = decision.reusablePayment;
+      if (payment) {
+        await payment.update({
+          payhereOrderId: newPayhereOrderId,
+          amount: decision.balance,
+          currency,
+          paymentMethod: 'card',
+          status: 'pending',
+          completedAt: null,
+          transactionId: null,
+          payherePaymentId: null,
+        }, { transaction });
+      } else {
+        payment = await Payment.create({
+          payhereOrderId: newPayhereOrderId,
+          order_id: order.order_id,
+          amount: decision.balance,
+          currency,
+          paymentMethod: 'card',
+          paymentType: 'full',
+          status: 'pending',
+        }, { transaction });
+      }
+      return { order, balance: decision.balance, payment, currency };
     });
-    if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
-    if (!['approved', 'finished'].includes(order.status)) {
-      return res.status(400).json({ success: false, error: 'The balance is available after proof approval' });
-    }
-
-    const completed = Number(await Payment.sum('amount', {
-      where: { order_id: order.order_id, status: 'completed' },
-    }) || 0);
-    const balance = Math.max(0, Number(order.calculated_price || 0) - completed);
-    if (balance <= 0) return res.status(400).json({ success: false, error: 'This order is already paid in full' });
-
-    const currency = order.currency || 'LKR';
-    if (!PAYHERE_ALLOWED_CURRENCIES.includes(currency)) {
-      return res.status(400).json({ success: false, error: `PayHere is not configured for ${currency}` });
-    }
+    const { order, balance, payment, currency } = checkout;
 
     const gatewayAmount = calculateDisplayAmount(balance, currency);
-    const payment = await Payment.create({
-      payhereOrderId: createOrderId(), order_id: order.order_id, amount: balance,
-      currency, paymentMethod: 'card', paymentType: 'full', status: 'pending',
-    });
     const hash = createPayhereCheckoutHash({
       merchantId: PAYHERE_MERCHANT_ID, orderId: payment.payhereOrderId,
       amount: gatewayAmount, currency, merchantSecret: PAYHERE_MERCHANT_SECRET,
@@ -474,7 +503,14 @@ router.post('/orders/:id/balance-checkout', requireCustomer, async (req, res) =>
     res.status(201).json({ success: true, checkoutUrl: PAYHERE_CHECKOUT_URL, checkoutFields, orderId: payment.payhereOrderId });
   } catch (error) {
     console.error('Error creating balance checkout:', error);
-    res.status(500).json({ success: false, error: 'Failed to create balance checkout' });
+    if (error.name === 'SequelizeUniqueConstraintError') {
+      return res.status(409).json({ success: false, error: 'A balance checkout is already active for this order', code: 'BALANCE_CHECKOUT_ACTIVE' });
+    }
+    res.status(error.statusCode || 500).json({
+      success: false,
+      error: error.statusCode ? error.message : 'Failed to create balance checkout',
+      code: error.code,
+    });
   }
 });
 
@@ -509,6 +545,7 @@ router.post('/payhere-notify', async (req, res) => {
     });
 
     if (localMd5sig !== md5sig) {
+      if (payment.status === 'completed') return res.status(400).send('Invalid signature');
       await payment.update({
         status: 'failed',
         metadata: {
@@ -521,8 +558,25 @@ router.post('/payhere-notify', async (req, res) => {
       return res.status(400).send('Invalid signature');
     }
 
+    const nextStatus = mapPayhereStatus(status_code);
+    let callbackDecision;
+    try {
+      callbackDecision = paymentCallbackDecision({
+        currentStatus: payment.status,
+        nextStatus,
+        expectedAmount: payment.amount,
+        receivedAmount: payhere_amount,
+        expectedCurrency: payment.currency,
+        receivedCurrency: payhere_currency,
+      });
+    } catch (error) {
+      return res.status(error.statusCode || 400).send(error.message);
+    }
+    if (callbackDecision.idempotent) return res.send('OK');
+
     await payment.update({
-      status: mapPayhereStatus(status_code),
+      status: callbackDecision.status,
+      completedAt: callbackDecision.status === 'completed' ? new Date() : null,
       transactionId: payment_id || null,
       payherePaymentId: payment_id || null,
       metadata: {
@@ -565,6 +619,7 @@ router.post('/sandbox-confirm-return/:orderId', requireCustomer, requireOwnedPay
     if (payment.status === 'pending') {
       await payment.update({
         status: 'completed',
+        completedAt: new Date(),
         transactionId: payment.transactionId || `SANDBOX-${Date.now()}`,
         metadata: {
           ...(payment.metadata || {}),
@@ -631,6 +686,7 @@ router.post('/process', requireCustomer, async (req, res) => {
     // Update payment record
     await payment.update({
       status: 'completed',
+      completedAt: new Date(),
       transactionId: result.transactionId,
       bankReference: result.reference || null,
       metadata: result
@@ -724,15 +780,31 @@ router.get('/:orderId/invoice', requirePaymentViewer, requireOwnedPayment, async
 // 8. Get All Payments (for admin)
 router.get('/', requireAdmin, async (req, res) => {
   try {
-    const payments = await Payment.findAll({
-      include: [{
-        model: db.Order,
-        as: 'order',
-        include: [{ model: db.Customer, as: 'customer' }],
-      }],
-      order: [['createdAt', 'DESC']]
+    const { page, limit, offset } = paginationFrom(req.query);
+    const [{ count, rows: payments }, completedPayments] = await Promise.all([
+      Payment.findAndCountAll({
+        include: [{
+          model: db.Order,
+          as: 'order',
+          include: [{ model: db.Customer, as: 'customer' }],
+        }],
+        order: [['createdAt', 'DESC']],
+        distinct: true,
+        limit,
+        offset,
+      }),
+      Payment.findAll({
+        where: { status: 'completed' },
+        attributes: ['order_id', 'paymentType', 'amount', 'status'],
+        raw: true,
+      }),
+    ]);
+    res.json({
+      success: true,
+      payments,
+      summary: paymentSummary(completedPayments),
+      pagination: paginationMeta(count, page, limit),
     });
-    res.json({ success: true, payments });
   } catch (error) {
     console.error('Error fetching payments:', error);
     res.status(500).json({
