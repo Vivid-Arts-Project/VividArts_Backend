@@ -60,11 +60,17 @@ const CURRENCIES = {
   GBP: { rate: 0.0024, symbol: '£' }
 };
 
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
-const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3001';
-const PAYHERE_MERCHANT_ID = process.env.PAYHERE_MERCHANT_ID;
-const PAYHERE_MERCHANT_SECRET = process.env.PAYHERE_MERCHANT_SECRET;
-const PAYHERE_CHECKOUT_URL = process.env.PAYHERE_SANDBOX === 'false'
+// Normalize copied dashboard values so PayHere's exact-match hash stays stable.
+const envValue = (name) => process.env[name]?.trim();
+const FRONTEND_URL = envValue('FRONTEND_URL') || 'http://localhost:3000';
+const BACKEND_URL = envValue('BACKEND_URL') || 'http://localhost:3001';
+const PAYHERE_MERCHANT_ID = envValue('PAYHERE_MERCHANT_ID');
+const PAYHERE_MERCHANT_SECRET = envValue('PAYHERE_MERCHANT_SECRET');
+const PAYHERE_SANDBOX = (envValue('PAYHERE_SANDBOX') || 'true').toLowerCase();
+const PAYHERE_INTEGRATION_DOMAIN = envValue('PAYHERE_INTEGRATION_DOMAIN')?.toLowerCase();
+// The PayHere server callback may be public even when the app itself runs locally.
+const PAYHERE_NOTIFY_URL = envValue('PAYHERE_NOTIFY_URL') || `${BACKEND_URL}/api/payments/payhere-notify`;
+const PAYHERE_CHECKOUT_URL = PAYHERE_SANDBOX === 'false'
   ? 'https://www.payhere.lk/pay/checkout'
   : 'https://sandbox.payhere.lk/pay/checkout';
 const PAYHERE_ALLOWED_CURRENCIES = (process.env.PAYHERE_ALLOWED_CURRENCIES || 'LKR')
@@ -160,19 +166,34 @@ router.post('/orders/:id/reference-photos', requireCustomer, async (req, res) =>
   });
 });
 
-const isPlaceholderValue = (value) => !value || String(value).trim().toLowerCase().startsWith('your');
+const isPlaceholderValue = (value) => !value || /^(your|replace[-_ ]with)/i.test(String(value).trim());
 
 const validatePayhereConfig = () => {
   if (isPlaceholderValue(PAYHERE_MERCHANT_ID) || isPlaceholderValue(PAYHERE_MERCHANT_SECRET)) {
     return 'Add your real PayHere sandbox merchant ID and merchant secret to server/.env';
   }
 
+  if (!/^\d{7}$/.test(PAYHERE_MERCHANT_ID)) {
+    return 'PAYHERE_MERCHANT_ID must be the 7-digit Merchant ID from the selected PayHere account';
+  }
+
+  if (!['true', 'false'].includes(PAYHERE_SANDBOX)) {
+    return 'PAYHERE_SANDBOX must be either true or false';
+  }
+
   if (isPlaceholderValue(BACKEND_URL)) {
     return 'Set BACKEND_URL in server/.env to your public backend URL. Use ngrok for local PayHere testing.';
   }
 
-  if (!/^https?:\/\//.test(FRONTEND_URL) || !/^https?:\/\//.test(BACKEND_URL)) {
-    return 'FRONTEND_URL and BACKEND_URL must start with http:// or https://';
+  if (![FRONTEND_URL, BACKEND_URL, PAYHERE_NOTIFY_URL].every((url) => /^https?:\/\//.test(url))) {
+    return 'FRONTEND_URL, BACKEND_URL, and PAYHERE_NOTIFY_URL must start with http:// or https://';
+  }
+
+  if (PAYHERE_INTEGRATION_DOMAIN) {
+    const frontendHostname = new URL(FRONTEND_URL).hostname.toLowerCase();
+    if (frontendHostname !== PAYHERE_INTEGRATION_DOMAIN) {
+      return `FRONTEND_URL must use the approved PayHere integration domain (${PAYHERE_INTEGRATION_DOMAIN})`;
+    }
   }
 
   return null;
@@ -335,7 +356,7 @@ router.post('/create-payhere-checkout', requireCustomer, async (req, res) => {
       merchant_id: PAYHERE_MERCHANT_ID,
       return_url: `${FRONTEND_URL}/commission/payment?payment=success&order_id=${payment.payhereOrderId}`,
       cancel_url: `${FRONTEND_URL}/commission/payment?payment=cancelled&order_id=${payment.payhereOrderId}`,
-      notify_url: `${BACKEND_URL}/api/payments/payhere-notify`,
+      notify_url: PAYHERE_NOTIFY_URL,
       order_id: payment.payhereOrderId,
       items: 'Vivid Arts portrait deposit',
       currency: selectedCurrency,
@@ -490,7 +511,7 @@ router.post('/orders/:id/balance-checkout', requireCustomer, async (req, res) =>
       merchant_id: PAYHERE_MERCHANT_ID,
       return_url: `${FRONTEND_URL}/commission/payment?payment=success&order_id=${payment.payhereOrderId}`,
       cancel_url: `${FRONTEND_URL}/my-orders`,
-      notify_url: `${BACKEND_URL}/api/payments/payhere-notify`,
+      notify_url: PAYHERE_NOTIFY_URL,
       order_id: payment.payhereOrderId,
       items: `Vivid Arts order ${order.order_id.slice(0, 8)} balance`,
       currency, amount: gatewayAmount,
@@ -610,7 +631,7 @@ router.post('/payhere-notify', async (req, res) => {
 // Production payments must always be confirmed by /payhere-notify above.
 router.post('/sandbox-confirm-return/:orderId', requireCustomer, requireOwnedPayment, async (req, res) => {
   try {
-    if (process.env.NODE_ENV !== 'development' || process.env.PAYHERE_SANDBOX === 'false') {
+    if (process.env.NODE_ENV !== 'development' || PAYHERE_SANDBOX === 'false') {
       return res.status(404).json({ success: false, error: 'Not found' });
     }
 
