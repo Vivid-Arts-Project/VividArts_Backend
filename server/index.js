@@ -1,14 +1,19 @@
+const { startUrgentReminderCron } = require('./utils/urgentReminderCron');
 require('dotenv').config();
 
 const express = require('express');
 const session = require('express-session');
 const cors    = require('cors');
-const app     = express();
+const app     = express();  
 const port    = Number(process.env.PORT) || 5000;
 const isProduction = process.env.NODE_ENV === 'production';
 const db = require('./models');
+const { startEmailQueueWorker } = require('./middleware/email');
 const SequelizeSessionStore = require('./sessionStore');
 const sessionStore = new SequelizeSessionStore(db.AdminSession);
+
+
+const { ensurePriceCatalog } = require('./utils/pricing');
 
 const sessionSecret = process.env.SESSION_SECRET || '';
 const weakSessionSecret = sessionSecret.length < 32
@@ -97,7 +102,7 @@ const adminAuthRouter = require('./routes/adminAuth');  // login, register, /me
 const adminRouter     = require('./routes/admin');       // orders, proofs, pricing
 const ordersRouter = require('./routes/orders');
 const contentRouter = require('./routes/content');
-const { ensurePriceCatalog } = require('./utils/pricing');
+const customerNotificationsRouter = require('./routes/customerNotifications');
 
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
 app.use('/api/customers', customerRouter);
@@ -106,6 +111,7 @@ app.use('/api/admin',     adminAuthRouter); // POST /api/admin/login etc.
 app.use('/api/admin',     adminRouter);     // GET  /api/admin/orders etc.
 app.use('/api/orders', ordersRouter);
 app.use('/api/content', contentRouter);
+app.use('/api/customers/notifications', customerNotificationsRouter);
 
 // ── 6. Sync DB and start ──────────────────────────────────────────────────────
 // Create any missing tables once on startup without resetting existing data.
@@ -113,6 +119,8 @@ db.sequelize.authenticate()
   .then(async () => {
     await ensurePriceCatalog();
     await sessionStore.clearExpired();
+    startEmailQueueWorker();
+    startUrgentReminderCron();
     app.listen(port, () => console.log(`✓ Server running on http://localhost:${port}`));
   })
   .catch(err => console.error('✗ DB connection failed:', err));

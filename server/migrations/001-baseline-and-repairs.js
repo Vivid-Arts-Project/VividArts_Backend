@@ -4,6 +4,7 @@ const {
   ensureCustomerProfileColumns,
   ensureOrderWorkflowColumns,
   ensureNotificationOrderIdColumn,
+  ensureVerificationTokenTable,
 } = require('../utils/schema');
 
 module.exports = {
@@ -22,6 +23,7 @@ module.exports = {
     await ensureAdminProfileColumns(sequelize);
     await ensureOrderWorkflowColumns(sequelize);
     await ensureNotificationOrderIdColumn(sequelize);
+    await ensureVerificationTokenTable(sequelize);
     for (const model of Object.values(db.sequelize.models)) {
       await model.sync({ withoutForeignKeyConstraints: true });
     }
