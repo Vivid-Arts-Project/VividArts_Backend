@@ -141,6 +141,11 @@ module.exports = (sequelize, DataTypes) => {
       foreignKey: 'order_id',
       as: 'messages',
     });
+
+    Order.hasOne(models.Review, {
+      foreignKey: 'order_id',
+      as: 'review',
+    });
   };
 
   return Order;

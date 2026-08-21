@@ -16,6 +16,39 @@ router.get('/gallery', async (_req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+router.get('/reviews', async (_req, res) => {
+  try {
+    const reviews = await db.Review.findAll({
+      where: { status: 'approved' },
+      include: [
+        { model: db.Customer, as: 'customer', attributes: ['full_name', 'username', 'profile_image_url'] },
+        { model: db.Order, as: 'order', attributes: ['order_id'], include: [{ model: db.ProductOption, as: 'productOption', attributes: ['paper_size', 'num_subjects'] }] },
+      ],
+      order: [['createdAt', 'DESC']],
+      limit: 6,
+    });
+    res.json(reviews.map(instance => {
+      const review = instance.toJSON();
+      const fullName = (review.customer?.full_name || review.customer?.username || 'Vivid customer').trim();
+      const parts = fullName.split(/\s+/);
+      const displayName = parts.length > 1 ? `${parts[0]} ${parts.at(-1).charAt(0)}.` : parts[0];
+      return {
+        id: review.review_id,
+        rating: review.rating,
+        title: review.title,
+        comment: review.comment,
+        imageUrl: review.allow_public_image ? review.image_url : null,
+        customerName: displayName,
+        customerAvatar: review.customer?.profile_image_url || null,
+        paperSize: review.order?.productOption?.paper_size || null,
+        subjects: review.order?.productOption?.num_subjects || null,
+        adminReply: review.admin_reply,
+        createdAt: review.createdAt,
+      };
+    }));
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 router.get('/admin/gallery', requireAdmin, async (_req, res) => {
   try { res.json(await db.GalleryImage.findAll({ order: [['sortOrder', 'ASC'], ['id', 'ASC']] })); }
   catch (error) { res.status(500).json({ error: error.message }); }

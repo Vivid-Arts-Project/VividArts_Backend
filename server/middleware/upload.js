@@ -117,6 +117,15 @@ const galleryStorage = new CloudinaryStorage({
   }),
 });
 
+const reviewStorage = new CloudinaryStorage({
+  params: (req) => ({
+    folder: 'art-studio/reviews',
+    public_id: `review_${req.params.id}_${Date.now()}`,
+    allowed_formats: ['jpg', 'jpeg', 'png', 'webp'],
+    transformation: [{ quality: 'auto', fetch_format: 'auto' }],
+  }),
+});
+
 // ─── Multer instances ────────────────────────────────────────────────────────
 // The local Multer storage engine streams files directly to Cloudinary.
 // req.file.path  → the full Cloudinary HTTPS URL  (use this to save in DB)
@@ -153,6 +162,12 @@ const uploadGallery = multer({
   fileFilter: imageFilter,
   limits: { fileSize: 10 * 1024 * 1024 },
 }).single('image');
+
+const uploadReview = multer({
+  storage: reviewStorage,
+  fileFilter: imageFilter,
+  limits: { fileSize: 5 * 1024 * 1024 },
+}).single('reviewImage');
 
 // ─── Helper: delete an image from Cloudinary by its public_id ───────────────
 // Use this if you ever need to replace or remove a stored image.
@@ -192,4 +207,4 @@ const uploadProfileImage = async (file, customerId) => {
   }
 };
 
-module.exports = { uploadProof, uploadReferences, uploadProfile, uploadProfileImage, uploadCover, uploadGallery, deleteImage, cloudinary };
+module.exports = { uploadProof, uploadReferences, uploadProfile, uploadProfileImage, uploadCover, uploadGallery, uploadReview, deleteImage, cloudinary };
