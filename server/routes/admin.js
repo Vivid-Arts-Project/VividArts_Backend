@@ -17,7 +17,10 @@ const ensureUrgentDeadlineNotifications = async () => {
   tomorrow.setDate(tomorrow.getDate() + 1);
   const deadline = `${tomorrow.getFullYear()}-${String(tomorrow.getMonth() + 1).padStart(2, '0')}-${String(tomorrow.getDate()).padStart(2, '0')}`;
   const urgentOrders = await db.Order.findAll({
-    where: { status: { [db.Sequelize.Op.notIn]: ['done'] } },
+    where: {
+      status: { [db.Sequelize.Op.notIn]: ['done'] },
+      amount_paid: { [db.Sequelize.Op.gt]: 0 },
+    },
     include: [{
       model: db.ProductOption,
       as: 'productOption',
@@ -251,6 +254,7 @@ router.get('/orders', requireAdmin, async (req, res) => {
     await ensureUrgentDeadlineNotifications();
     const { page, limit, offset } = paginationFrom(req.query);
     const queueRows = await db.Order.findAll({
+      where: { amount_paid: { [db.Sequelize.Op.gt]: 0 } },
       attributes: ['order_id', 'status', 'is_urgent', 'calculated_price', 'amount_paid', 'createdAt'],
       include: [{ model: db.ProductOption, as: 'productOption', attributes: ['urgent_deadline', 'num_subjects'] }],
     });
@@ -289,6 +293,8 @@ router.get('/customers', requireAdmin, async (req, res) => {
       include: [{
         model: db.Order,
         as: 'orders',
+        where: { amount_paid: { [db.Sequelize.Op.gt]: 0 } },
+        required: false,
         attributes: ['order_id', 'currency', 'calculated_price', 'amount_paid', 'status', 'createdAt'],
       }],
       order: [['createdAt', 'DESC']],
@@ -312,7 +318,7 @@ router.get('/orders/:id', requireAdmin, async (req, res) => {
         { model: db.Payment, as: 'payments' },
       ],
     });
-    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (!order || Number(order.amount_paid || 0) <= 0) return res.status(404).json({ error: 'Order not found' });
     res.json(orderJson(order));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
