@@ -38,6 +38,7 @@ router.get('/my-orders', protect, async (req, res) => {
         || Number(order.amount_paid || 0);
       const currentProof = (order.proofImages || []).find(proof => proof.is_current);
       const checkoutDetails = (completedPayments[0] || order.payments?.[0])?.metadata?.order || {};
+      const paymentStatus = completedPayments.length ? 'paid' : 'payment_pending';
 
       return {
         id: order.order_id,
@@ -65,6 +66,7 @@ router.get('/my-orders', protect, async (req, res) => {
         amountPaid,
         balanceDue: Math.max(0, Number(order.calculated_price || 0) - amountPaid),
         paymentType: order.payment_type,
+        paymentStatus,
         payments: (order.payments || []).map(payment => ({
           id: payment.paymentId,
           providerOrderId: payment.payhereOrderId,
@@ -108,6 +110,7 @@ router.post('/:id/messages', protect, async (req, res) => {
   try {
     const order = await db.Order.findOne({ where: { order_id: req.params.id, customer_id: req.user.customerId } });
     if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (Number(order.amount_paid || 0) <= 0) return res.status(409).json({ error: 'Complete the deposit payment before messaging the artist' });
     if (!req.body.message?.trim()) return res.status(400).json({ error: 'Message is required' });
     const message = await db.Message.create({ order_id: order.order_id, sender_type: 'customer', sender_id: String(req.user.customerId), message_text: req.body.message.trim() });
     await createAdminNotification({
@@ -124,6 +127,7 @@ router.post('/:id/proof-review', protect, async (req, res) => {
   try {
     const order = await db.Order.findOne({ where: { order_id: req.params.id, customer_id: req.user.customerId }, include: [{ model: db.ProofImage, as: 'proofImages' }] });
     if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (Number(order.amount_paid || 0) <= 0) return res.status(409).json({ error: 'Complete the deposit payment before reviewing a proof' });
     const proof = order.proofImages.find(p => p.is_current);
     if (!proof) return res.status(400).json({ error: 'No proof is awaiting review' });
     const approved = req.body.action === 'approve';
