@@ -3,10 +3,23 @@ const db = require('../models');
 
 const requiredSmtpVariables = ['SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS'];
 const DEFAULT_EMAIL_RETRY_LIMIT = 3;
+let emailDeliveryTablePromise = null;
 
 async function ensureEmailDeliveryTable() {
-  if (!db?.sequelize?.models?.EmailDelivery) return;
-  await db.sequelize.models.EmailDelivery.sync({ alter: true });
+  const EmailDelivery = db?.sequelize?.models?.EmailDelivery;
+  if (!EmailDelivery) return;
+
+  // Schema changes belong in migrations. `alter: true` here caused the
+  // 30-second queue worker to repeatedly rebuild/alter this table. A normal
+  // sync is non-destructive (CREATE TABLE IF NOT EXISTS) and only needs to run
+  // once per server process as a safeguard for fresh development databases.
+  if (!emailDeliveryTablePromise) {
+    emailDeliveryTablePromise = EmailDelivery.sync().catch((error) => {
+      emailDeliveryTablePromise = null;
+      throw error;
+    });
+  }
+  await emailDeliveryTablePromise;
 }
 
 function getMissingSmtpVariables() {
