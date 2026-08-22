@@ -87,7 +87,11 @@ const getUrgentAvailability = async (transaction) => {
   const windowStart = new Date();
   windowStart.setDate(windowStart.getDate() - URGENT_WINDOW_DAYS);
   const accepted = await db.Order.count({
-    where: { is_urgent: true, createdAt: { [db.Sequelize.Op.gte]: windowStart } },
+    where: {
+      is_urgent: true,
+      amount_paid: { [db.Sequelize.Op.gt]: 0 },
+      createdAt: { [db.Sequelize.Op.gte]: windowStart },
+    },
     transaction,
   });
   return {
@@ -235,6 +239,52 @@ const syncLinkedOrderPayment = async (payment) => {
   );
 };
 
+const completeInitialOrderPayment = async (payment) => {
+  await syncLinkedOrderPayment(payment);
+  if (payment.status !== 'completed' || payment.metadata?.balancePayment) return;
+
+  const computedOrder = payment.metadata?.order || {};
+  await createAdminNotification({
+    orderId: payment.order_id,
+    type: 'order',
+    title: 'New portrait order',
+    message: `A new ${computedOrder.sizeLabel || computedOrder.sizeId || ''} portrait order was paid and confirmed.`.replace('new  portrait', 'new portrait'),
+  });
+};
+
+const buildInitialCheckout = ({ payment, customer = {} }) => {
+  const gatewayAmount = calculateDisplayAmount(payment.amount, payment.currency);
+  const hash = createPayhereCheckoutHash({
+    merchantId: PAYHERE_MERCHANT_ID,
+    orderId: payment.payhereOrderId,
+    amount: gatewayAmount,
+    currency: payment.currency,
+    merchantSecret: PAYHERE_MERCHANT_SECRET,
+  });
+  return {
+    hash,
+    gatewayAmount,
+    fields: {
+      merchant_id: PAYHERE_MERCHANT_ID,
+      return_url: `${FRONTEND_URL}/commission/payment?payment=success&order_id=${payment.payhereOrderId}`,
+      cancel_url: `${FRONTEND_URL}/commission/payment?payment=cancelled&order_id=${payment.payhereOrderId}`,
+      notify_url: PAYHERE_NOTIFY_URL,
+      order_id: payment.payhereOrderId,
+      items: 'Vivid Arts portrait deposit',
+      currency: payment.currency,
+      amount: gatewayAmount,
+      first_name: customer.firstName || 'Vivid',
+      last_name: customer.lastName || '-',
+      email: customer.email || 'customer@example.com',
+      phone: customer.phone || '0771234567',
+      address: customer.address || 'Colombo',
+      city: customer.city || 'Colombo',
+      country: customer.country || 'Sri Lanka',
+      hash,
+    },
+  };
+};
+
 // ============= ROUTES =============
 
 // Current position for the next portrait entering the production queue.
@@ -242,7 +292,10 @@ const syncLinkedOrderPayment = async (payment) => {
 router.get('/queue-position', requireCustomer, async (_req, res) => {
   try {
     const activeOrders = await db.Order.count({
-      where: { status: { [db.Sequelize.Op.ne]: 'done' } },
+      where: {
+        status: { [db.Sequelize.Op.ne]: 'done' },
+        amount_paid: { [db.Sequelize.Op.gt]: 0 },
+      },
     });
 
     res.json({
@@ -259,7 +312,7 @@ router.get('/queue-position', requireCustomer, async (_req, res) => {
 // 1. Create Payment Order
 router.post('/create-order', requireCustomer, async (req, res) => {
   try {
-    const { currency, paymentMethod, bankDetails, order } = req.body;
+    const { currency, paymentMethod, bankDetails, order, customer = {} } = req.body;
     const computedOrder = await calculateOrder(order);
     await assertUrgentAvailability(computedOrder);
 
@@ -269,7 +322,18 @@ router.post('/create-order', requireCustomer, async (req, res) => {
       currency: currency || 'LKR',
       paymentMethod: paymentMethod || 'card',
       status: 'pending',
-      metadata: { order: computedOrder },
+      metadata: {
+        order: computedOrder,
+        customer: {
+          firstName: customer.firstName || null,
+          lastName: customer.lastName || null,
+          email: customer.email || null,
+          phone: customer.phone || null,
+          address: customer.address || null,
+          city: customer.city || null,
+          country: customer.country || null,
+        },
+      },
       ...(paymentMethod === 'bank' && bankDetails ? {
         bankName: bankDetails.bankName || null
       } : {})
@@ -277,13 +341,6 @@ router.post('/create-order', requireCustomer, async (req, res) => {
 
     const payment = await Payment.create(orderData);
     const commission = await createCommission(req, computedOrder, payment);
-    await createAdminNotification({
-      orderId: commission.order_id,
-      type: 'order',
-      title: 'New portrait order',
-      message: `A new ${computedOrder.sizeLabel || computedOrder.sizeId} portrait order was placed.`,
-    });
-
     res.status(201).json({
       success: true,
       payment: {
@@ -327,8 +384,6 @@ router.post('/create-payhere-checkout', requireCustomer, async (req, res) => {
 
     const computedOrder = await calculateOrder(order);
     await assertUrgentAvailability(computedOrder);
-    const gatewayAmount = calculateDisplayAmount(computedOrder.dueAmount, selectedCurrency);
-
     const payment = await Payment.create({
       payhereOrderId: createOrderId(),
       amount: computedOrder.dueAmount,
@@ -337,44 +392,12 @@ router.post('/create-payhere-checkout', requireCustomer, async (req, res) => {
       status: 'pending'
     });
     const commission = await createCommission(req, computedOrder, payment);
-    await createAdminNotification({
-      orderId: commission.order_id,
-      type: 'order',
-      title: 'New portrait order',
-      message: `A new ${computedOrder.sizeLabel || computedOrder.sizeId} portrait order was placed.`,
-    });
-
-    const hash = createPayhereCheckoutHash({
-      merchantId: PAYHERE_MERCHANT_ID,
-      orderId: payment.payhereOrderId,
-      amount: gatewayAmount,
-      currency: selectedCurrency,
-      merchantSecret: PAYHERE_MERCHANT_SECRET
-    });
-
-    const checkoutFields = {
-      merchant_id: PAYHERE_MERCHANT_ID,
-      return_url: `${FRONTEND_URL}/commission/payment?payment=success&order_id=${payment.payhereOrderId}`,
-      cancel_url: `${FRONTEND_URL}/commission/payment?payment=cancelled&order_id=${payment.payhereOrderId}`,
-      notify_url: PAYHERE_NOTIFY_URL,
-      order_id: payment.payhereOrderId,
-      items: 'Vivid Arts portrait deposit',
-      currency: selectedCurrency,
-      amount: gatewayAmount,
-      first_name: customer.firstName || 'Vivid',
-      last_name: customer.lastName || '-',
-      email: customer.email || 'customer@example.com',
-      phone: customer.phone || '0771234567',
-      address: customer.address || 'Colombo',
-      city: customer.city || 'Colombo',
-      country: customer.country || 'Sri Lanka',
-      hash
-    };
+    const { hash, fields: checkoutFields } = buildInitialCheckout({ payment, customer });
 
     await payment.update({
       payhereMd5sig: hash,
       metadata: {
-        checkoutAmount: gatewayAmount,
+        checkoutAmount: checkoutFields.amount,
         checkoutCurrency: selectedCurrency,
         order: computedOrder,
         customer: {
@@ -408,10 +431,78 @@ router.post('/create-payhere-checkout', requireCustomer, async (req, res) => {
   }
 });
 
+// Re-open the deposit checkout for a commission that the customer left unpaid.
+router.post('/orders/:id/resume-checkout', requireCustomer, async (req, res) => {
+  try {
+    const configError = validatePayhereConfig();
+    if (configError) return res.status(500).json({ success: false, error: configError });
+
+    const order = await db.Order.findOne({
+      where: { order_id: req.params.id, customer_id: req.customerId },
+      include: [
+        { model: db.Payment, as: 'payments' },
+        { model: db.Customer, as: 'customer' },
+      ],
+    });
+    if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
+    if (Number(order.amount_paid || 0) > 0) {
+      return res.status(400).json({ success: false, error: 'The deposit for this order is already paid' });
+    }
+
+    const payment = order.payments?.find(item => item.paymentType === 'advance');
+    if (!payment || payment.status === 'completed') {
+      return res.status(400).json({ success: false, error: 'No pending deposit was found for this order' });
+    }
+
+    const fullName = (order.customer?.full_name || order.customer?.username || 'Vivid Customer').trim();
+    const [firstName, ...lastNameParts] = fullName.split(/\s+/);
+    const storedCustomer = payment.metadata?.customer || {};
+    const customerDetails = {
+      firstName: storedCustomer.firstName || firstName,
+      lastName: storedCustomer.lastName || lastNameParts.join(' ') || '-',
+      email: storedCustomer.email || order.customer?.email,
+      phone: storedCustomer.phone || order.customer?.phone_number,
+      address: storedCustomer.address || order.customer?.address,
+      city: storedCustomer.city || 'Colombo',
+      country: storedCustomer.country || 'Sri Lanka',
+    };
+    await payment.update({
+      payhereOrderId: createOrderId(),
+      status: 'pending',
+      completedAt: null,
+      transactionId: null,
+      payherePaymentId: null,
+    });
+    const { hash, gatewayAmount, fields } = buildInitialCheckout({ payment, customer: customerDetails });
+    await payment.update({
+      payhereMd5sig: hash,
+      metadata: {
+        ...(payment.metadata || {}),
+        checkoutAmount: gatewayAmount,
+        checkoutCurrency: payment.currency,
+      },
+    });
+
+    res.status(201).json({
+      success: true,
+      checkoutUrl: PAYHERE_CHECKOUT_URL,
+      checkoutFields: fields,
+      orderId: payment.payhereOrderId,
+      commissionId: order.order_id,
+    });
+  } catch (error) {
+    console.error('Error resuming PayHere checkout:', error);
+    res.status(500).json({ success: false, error: 'Unable to resume payment' });
+  }
+});
+
 router.post('/timeline-preview', requireCustomer, async (req, res) => {
   try {
     const orders = await db.Order.findAll({
-      where: { status: { [db.Sequelize.Op.in]: ACTIVE_STATUSES } },
+      where: {
+        status: { [db.Sequelize.Op.in]: ACTIVE_STATUSES },
+        amount_paid: { [db.Sequelize.Op.gt]: 0 },
+      },
       include: [{ model: db.ProductOption, as: 'productOption' }],
     });
     const proposedOrder = {
@@ -613,6 +704,7 @@ router.post('/payhere-notify', async (req, res) => {
     await syncLinkedOrderPayment(payment);
 
     if (payment.status === 'completed') {
+      await completeInitialOrderPayment(payment);
       ensureInvoiceGenerated(payment).catch((err) => {
         console.error('Invoice generation failed:', err);
       });
@@ -637,7 +729,8 @@ router.post('/sandbox-confirm-return/:orderId', requireCustomer, requireOwnedPay
 
     const payment = req.payment;
 
-    if (payment.status === 'pending') {
+    const wasPending = payment.status === 'pending';
+    if (wasPending) {
       await payment.update({
         status: 'completed',
         completedAt: new Date(),
@@ -650,6 +743,7 @@ router.post('/sandbox-confirm-return/:orderId', requireCustomer, requireOwnedPay
     }
 
     await syncLinkedOrderPayment(payment);
+    if (wasPending && payment.status === 'completed') await completeInitialOrderPayment(payment);
 
     await ensureInvoiceGenerated(payment);
     res.json({
@@ -704,6 +798,7 @@ router.post('/process', requireCustomer, async (req, res) => {
       });
     }
 
+    const wasPending = payment.status === 'pending';
     // Update payment record
     await payment.update({
       status: 'completed',
@@ -714,6 +809,7 @@ router.post('/process', requireCustomer, async (req, res) => {
     });
 
     await syncLinkedOrderPayment(payment);
+    if (wasPending) await completeInitialOrderPayment(payment);
 
     ensureInvoiceGenerated(payment).catch((err) => {
       console.error('Invoice generation failed:', err);
@@ -804,6 +900,7 @@ router.get('/', requireAdmin, async (req, res) => {
     const { page, limit, offset } = paginationFrom(req.query);
     const [{ count, rows: payments }, completedPayments] = await Promise.all([
       Payment.findAndCountAll({
+        where: { status: 'completed' },
         include: [{
           model: db.Order,
           as: 'order',

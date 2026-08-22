@@ -18,7 +18,10 @@ const ensureUrgentDeadlineNotifications = async () => {
   tomorrow.setDate(tomorrow.getDate() + 1);
   const deadline = `${tomorrow.getFullYear()}-${String(tomorrow.getMonth() + 1).padStart(2, '0')}-${String(tomorrow.getDate()).padStart(2, '0')}`;
   const urgentOrders = await db.Order.findAll({
-    where: { status: { [db.Sequelize.Op.notIn]: ['done'] } },
+    where: {
+      status: { [db.Sequelize.Op.notIn]: ['done'] },
+      amount_paid: { [db.Sequelize.Op.gt]: 0 },
+    },
     include: [{
       model: db.ProductOption,
       as: 'productOption',
@@ -240,6 +243,68 @@ router.delete('/activity-notifications/:id', requireAdmin, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// VERIFIED CUSTOMER REVIEWS
+// ════════════════════════════════════════════════════════════════════════════
+router.get('/reviews', requireAdmin, async (req, res) => {
+  try {
+    const { page, limit, offset } = paginationFrom(req.query);
+    const where = ['pending', 'approved', 'rejected'].includes(req.query.status)
+      ? { status: req.query.status }
+      : {};
+    const { count, rows } = await db.Review.findAndCountAll({
+      where,
+      include: [
+        { model: db.Customer, as: 'customer', attributes: ['customer_id', 'full_name', 'username', 'email', 'profile_image_url'] },
+        { model: db.Order, as: 'order', attributes: ['order_id'], include: [{ model: db.ProductOption, as: 'productOption', attributes: ['paper_size', 'num_subjects'] }] },
+      ],
+      order: [['createdAt', 'DESC']],
+      distinct: true,
+      limit,
+      offset,
+    });
+    res.json({ reviews: rows, pagination: paginationMeta(count, page, limit) });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+router.patch('/reviews/:id', requireAdmin, async (req, res) => {
+  try {
+    const review = await db.Review.findByPk(req.params.id);
+    if (!review) return res.status(404).json({ error: 'Review not found' });
+    const updates = {};
+    if (req.body.status !== undefined) {
+      if (!['pending', 'approved', 'rejected'].includes(req.body.status)) return res.status(400).json({ error: 'Invalid review status' });
+      updates.status = req.body.status;
+    }
+    if (req.body.adminReply !== undefined) updates.admin_reply = String(req.body.adminReply || '').trim().slice(0, 1000) || null;
+    await review.update(updates);
+
+    if (updates.status && updates.status !== 'pending') {
+      await createNotification(
+        review.customer_id,
+        review.order_id,
+        updates.status === 'approved' ? 'Review approved' : 'Review update',
+        updates.status === 'approved'
+          ? 'Thank you! Your verified review has been approved.'
+          : 'Your review was not approved for public display. You can edit and resubmit it.',
+        updates.status === 'approved' ? 'approved' : 'info',
+      );
+    }
+    res.json({ message: 'Review updated', review });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+router.delete('/reviews/:id', requireAdmin, async (req, res) => {
+  try {
+    const review = await db.Review.findByPk(req.params.id);
+    if (!review) return res.status(404).json({ error: 'Review not found' });
+    const publicId = review.image_public_id;
+    await review.destroy();
+    if (publicId) await deleteImage(publicId).catch(() => {});
+    res.json({ message: 'Review deleted' });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // ADMIN PROFILE  (Settings page reads and writes these)
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -318,6 +383,7 @@ router.get('/orders', requireAdmin, async (req, res) => {
     await ensureUrgentDeadlineNotifications();
     const { page, limit, offset } = paginationFrom(req.query);
     const queueRows = await db.Order.findAll({
+      where: { amount_paid: { [db.Sequelize.Op.gt]: 0 } },
       attributes: ['order_id', 'status', 'is_urgent', 'calculated_price', 'amount_paid', 'createdAt'],
       include: [{ model: db.ProductOption, as: 'productOption', attributes: ['urgent_deadline', 'num_subjects'] }],
     });
@@ -356,6 +422,8 @@ router.get('/customers', requireAdmin, async (req, res) => {
       include: [{
         model: db.Order,
         as: 'orders',
+        where: { amount_paid: { [db.Sequelize.Op.gt]: 0 } },
+        required: false,
         attributes: ['order_id', 'currency', 'calculated_price', 'amount_paid', 'status', 'createdAt'],
       }],
       order: [['createdAt', 'DESC']],
@@ -379,7 +447,7 @@ router.get('/orders/:id', requireAdmin, async (req, res) => {
         { model: db.Payment, as: 'payments' },
       ],
     });
-    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (!order || Number(order.amount_paid || 0) <= 0) return res.status(404).json({ error: 'Order not found' });
     res.json(orderJson(order));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -410,6 +478,10 @@ router.get('/orders/:id/reference-photos/:index/download', requireAdmin, async (
 
 router.delete('/orders/:id', requireAdmin, async (req, res) => {
   try {
+    const cancellationReason = String(req.body?.reason || '').trim();
+    if (!cancellationReason) return res.status(400).json({ error: 'A cancellation reason is required' });
+    if (cancellationReason.length > 500) return res.status(400).json({ error: 'Cancellation reason must be 500 characters or fewer' });
+
     const order = await db.Order.findByPk(req.params.id, {
       include: [
         { model: db.ReferencePhoto, as: 'referencePhotos' },
@@ -434,21 +506,18 @@ router.delete('/orders/:id', requireAdmin, async (req, res) => {
     });
 
     await Promise.allSettled(publicIds.map(deleteImage));
-    const cancellationReason = req.body?.reason?.trim();
     await createNotification(
       order.customer_id,
       null,
       'Order cancelled',
-      cancellationReason
-        ? `Your portrait order was cancelled by the studio. Reason: ${cancellationReason}`
-        : 'Your portrait order was cancelled by the studio.',
+      `Your portrait order was cancelled by the studio. Reason: ${cancellationReason}`,
       'cancelled',
     );
     await createAdminNotification({
       adminId: req.session.adminId,
       type: 'order',
       title: 'Order cancelled',
-      message: `Order #${order.order_id.slice(0, 8)} was permanently deleted${cancellationReason ? `: ${cancellationReason}` : '.'}`,
+      message: `Order #${order.order_id.slice(0, 8)} was permanently deleted: ${cancellationReason}`,
     });
 
     res.json({ message: 'Order cancelled and deleted' });

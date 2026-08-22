@@ -7,6 +7,7 @@ const { createAdminNotification } = require('../utils/adminNotificationHelper');
 const { createNotification, resolveNotificationCustomerId } = require('../utils/notificationHelper');
 const { paginationFrom, paginationMeta } = require('../utils/pagination');
 const { sendRevisionRequestedAdminEmail } = require('../middleware/email');
+const { uploadReview, deleteImage } = require('../middleware/upload');
 
 router.get('/my-orders', protect, async (req, res) => {
   try {
@@ -19,6 +20,7 @@ router.get('/my-orders', protect, async (req, res) => {
         { model: db.ProofImage, as: 'proofImages' },
         { model: db.Payment, as: 'payments' },
         { model: db.Message, as: 'messages' },
+        { model: db.Review, as: 'review' },
       ],
       order: [
         ['createdAt', 'DESC'],
@@ -40,6 +42,7 @@ router.get('/my-orders', protect, async (req, res) => {
         || Number(order.amount_paid || 0);
       const currentProof = (order.proofImages || []).find(proof => proof.is_current);
       const checkoutDetails = (completedPayments[0] || order.payments?.[0])?.metadata?.order || {};
+      const paymentStatus = completedPayments.length ? 'paid' : 'payment_pending';
 
       return {
         id: order.order_id,
@@ -65,6 +68,7 @@ router.get('/my-orders', protect, async (req, res) => {
         amountPaid,
         balanceDue: Math.max(0, Number(order.calculated_price || 0) - amountPaid),
         paymentType: order.payment_type,
+        paymentStatus,
         payments: (order.payments || []).map(payment => ({
           id: payment.paymentId,
           providerOrderId: payment.payhereOrderId,
@@ -97,8 +101,169 @@ router.get('/my-orders', protect, async (req, res) => {
           message: message.message_text,
           createdAt: message.createdAt,
         })),
+        review: order.review ? {
+          id: order.review.review_id,
+          rating: order.review.rating,
+          title: order.review.title,
+          comment: order.review.comment,
+          imageUrl: order.review.image_url,
+          allowPublicImage: order.review.allow_public_image,
+          status: order.review.status,
+          adminReply: order.review.admin_reply,
+          createdAt: order.review.createdAt,
+          updatedAt: order.review.updatedAt,
+        } : null,
       };
     }));
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// Customers may discard saved checkout drafts only while no payment has been
+// completed. Paid orders remain part of the permanent order and invoice record.
+router.delete('/:id', protect, async (req, res) => {
+  let publicIds = [];
+  try {
+    await db.sequelize.transaction(async transaction => {
+      const order = await db.Order.findOne({
+        where: { order_id: req.params.id, customer_id: req.user.customerId },
+        include: [
+          { model: db.ReferencePhoto, as: 'referencePhotos' },
+          { model: db.ProofImage, as: 'proofImages' },
+          { model: db.Payment, as: 'payments' },
+          { model: db.Review, as: 'review' },
+        ],
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+      });
+      if (!order) throw Object.assign(new Error('Order not found'), { status: 404 });
+
+      const hasCompletedPayment = Number(order.amount_paid || 0) > 0
+        || (order.payments || []).some(payment => payment.status === 'completed');
+      if (hasCompletedPayment) {
+        throw Object.assign(new Error('Paid orders cannot be deleted. Please contact the studio if you need to cancel.'), { status: 409 });
+      }
+
+      publicIds = [
+        ...(order.referencePhotos || []).map(photo => photo.cloudinary_public_id),
+        ...(order.proofImages || []).map(proof => proof.cloudinary_public_id),
+        order.review?.image_public_id,
+      ].filter(Boolean);
+      const productId = order.product_id;
+
+      await db.Review.destroy({ where: { order_id: order.order_id }, transaction });
+      await db.Message.destroy({ where: { order_id: order.order_id }, transaction });
+      await db.ReferencePhoto.destroy({ where: { order_id: order.order_id }, transaction });
+      await db.ProofImage.destroy({ where: { order_id: order.order_id }, transaction });
+      await db.Payment.destroy({ where: { order_id: order.order_id }, transaction });
+      await db.AdminNotification.destroy({ where: { order_id: order.order_id }, transaction });
+      await order.destroy({ transaction });
+      if (productId) await db.ProductOption.destroy({ where: { product_id: productId }, transaction });
+    });
+
+    await Promise.allSettled(publicIds.map(deleteImage));
+    res.json({ message: 'Incomplete order deleted.' });
+  } catch (error) {
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+const reviewPayload = body => {
+  const rating = Number(body.rating);
+  const title = String(body.title || '').trim();
+  const comment = String(body.comment || '').trim();
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) return { error: 'Choose a rating from 1 to 5 stars' };
+  if (title.length < 3 || title.length > 120) return { error: 'Review title must be between 3 and 120 characters' };
+  if (comment.length < 10 || comment.length > 2000) return { error: 'Review must be between 10 and 2000 characters' };
+  return { rating, title, comment, allow_public_image: String(body.allowPublicImage) === 'true' };
+};
+
+const ownedCompletedOrder = (orderId, customerId) => db.Order.findOne({
+  where: { order_id: orderId, customer_id: customerId, status: 'done' },
+  include: [{ model: db.Review, as: 'review' }],
+});
+
+router.post('/:id/review', protect, (req, res) => uploadReview(req, res, async uploadError => {
+  if (uploadError) return res.status(400).json({ error: uploadError.message });
+  const payload = reviewPayload(req.body);
+  if (payload.error) {
+    if (req.file) await deleteImage(req.file.filename).catch(() => {});
+    return res.status(400).json({ error: payload.error });
+  }
+  try {
+    const order = await ownedCompletedOrder(req.params.id, req.user.customerId);
+    if (!order) {
+      if (req.file) await deleteImage(req.file.filename).catch(() => {});
+      return res.status(400).json({ error: 'Reviews are available after an order is completed' });
+    }
+    if (order.review) {
+      if (req.file) await deleteImage(req.file.filename).catch(() => {});
+      return res.status(409).json({ error: 'You already reviewed this order' });
+    }
+    const review = await db.Review.create({
+      order_id: order.order_id,
+      customer_id: req.user.customerId,
+      ...payload,
+      image_url: req.file?.path || null,
+      image_public_id: req.file?.filename || null,
+    });
+    await createAdminNotification({
+      orderId: order.order_id,
+      type: 'review',
+      title: 'New customer review',
+      message: `A verified ${payload.rating}-star review is waiting for approval.`,
+    });
+    res.status(201).json({ message: 'Review submitted for approval', review });
+  } catch (error) {
+    if (req.file) await deleteImage(req.file.filename).catch(() => {});
+    res.status(500).json({ error: error.message });
+  }
+}));
+
+router.patch('/:id/review', protect, (req, res) => uploadReview(req, res, async uploadError => {
+  if (uploadError) return res.status(400).json({ error: uploadError.message });
+  const payload = reviewPayload(req.body);
+  if (payload.error) {
+    if (req.file) await deleteImage(req.file.filename).catch(() => {});
+    return res.status(400).json({ error: payload.error });
+  }
+  try {
+    const order = await ownedCompletedOrder(req.params.id, req.user.customerId);
+    if (!order?.review) {
+      if (req.file) await deleteImage(req.file.filename).catch(() => {});
+      return res.status(404).json({ error: 'Review not found' });
+    }
+    const oldPublicId = order.review.image_public_id;
+    await order.review.update({
+      ...payload,
+      status: 'pending',
+      admin_reply: null,
+      ...(req.file ? { image_url: req.file.path, image_public_id: req.file.filename } : {}),
+    });
+    if (req.file && oldPublicId) await deleteImage(oldPublicId).catch(() => {});
+    await createAdminNotification({
+      orderId: order.order_id,
+      type: 'review',
+      title: 'Customer review updated',
+      message: `An updated ${payload.rating}-star review is waiting for approval.`,
+    });
+    res.json({ message: 'Review updated and sent for approval', review: order.review });
+  } catch (error) {
+    if (req.file) await deleteImage(req.file.filename).catch(() => {});
+    res.status(500).json({ error: error.message });
+  }
+}));
+
+router.delete('/:id/review', protect, async (req, res) => {
+  try {
+    const order = await db.Order.findOne({
+      where: { order_id: req.params.id, customer_id: req.user.customerId },
+      include: [{ model: db.Review, as: 'review' }],
+    });
+    if (!order?.review) return res.status(404).json({ error: 'Review not found' });
+    const publicId = order.review.image_public_id;
+    await order.review.destroy();
+    if (publicId) await deleteImage(publicId).catch(() => {});
+    res.json({ message: 'Review deleted' });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
@@ -106,6 +271,7 @@ router.post('/:id/messages', protect, async (req, res) => {
   try {
     const order = await db.Order.findOne({ where: { order_id: req.params.id, customer_id: req.user.customerId } });
     if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (Number(order.amount_paid || 0) <= 0) return res.status(409).json({ error: 'Complete the deposit payment before messaging the artist' });
     if (!req.body.message?.trim()) return res.status(400).json({ error: 'Message is required' });
     const message = await db.Message.create({ order_id: order.order_id, sender_type: 'customer', sender_id: String(req.user.customerId), message_text: req.body.message.trim() });
     await createAdminNotification({
@@ -128,6 +294,7 @@ router.post('/:id/proof-review', protect, async (req, res) => {
       ] 
     });
     if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (Number(order.amount_paid || 0) <= 0) return res.status(409).json({ error: 'Complete the deposit payment before reviewing a proof' });
     const proof = order.proofImages.find(p => p.is_current);
     if (!proof) return res.status(400).json({ error: 'No proof is awaiting review' });
     const approved = req.body.action === 'approve';
