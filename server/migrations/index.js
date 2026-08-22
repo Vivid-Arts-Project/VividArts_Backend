@@ -4,6 +4,9 @@ const paymentIntegrity = require('./002-payment-integrity');
 const reviews = require('./003-reviews');
 const emailDeliveryQueue = require('./003-email-delivery-queue');
 const verificationTokens = require('./004-verification-tokens');
+const adminControlsAndSiteSettings = require('./005-admin-controls-and-site-settings');
+const existingTableControls = require('./006-existing-table-controls');
+const adminAccountStatus = require('./007-admin-account-status');
 
 const migrations = [
   baseline,
@@ -11,6 +14,9 @@ const migrations = [
   reviews,
   emailDeliveryQueue,
   verificationTokens,
+  adminControlsAndSiteSettings,
+  existingTableControls,
+  adminAccountStatus,
 ];
 
 async function runMigrations(db) {

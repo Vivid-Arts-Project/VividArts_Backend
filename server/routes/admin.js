@@ -108,6 +108,14 @@ const requireAdmin = (req, res, next) => {
   if (!req.session?.adminId) return res.status(401).json({ error: 'Unauthorized' });
   next();
 };
+const requireSuperAdmin = async (req, res, next) => {
+  try {
+    const admin = await db.Admin.findByPk(req.session?.adminId, { attributes: ['id', 'isSuperAdmin', 'isActive'] });
+    if (!admin?.isActive || !admin.isSuperAdmin) return res.status(403).json({ error: 'Super administrator access is required' });
+    req.admin = admin;
+    next();
+  } catch (error) { next(error); }
+};
 
 // ════════════════════════════════════════════════════════════════════════════
 // ADMIN ACTIVITY NOTIFICATIONS
@@ -330,11 +338,38 @@ router.patch('/notifications', requireAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+router.get('/site-settings', requireAdmin, async (req, res) => {
+  try {
+    const [settings] = await db.SiteSetting.findOrCreate({
+      where: { id: 1 },
+      defaults: { id: 1, developmentMode: false, maintenanceMessage: 'The system is currently undergoing development. Please check back soon.' },
+    });
+    res.json(settings);
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+router.patch('/site-settings', requireAdmin, async (req, res) => {
+  try {
+    const admin = await db.Admin.findByPk(req.session.adminId);
+    if (!admin?.isSuperAdmin) return res.status(403).json({ error: 'Super administrator access is required' });
+    const [settings] = await db.SiteSetting.findOrCreate({
+      where: { id: 1 },
+      defaults: { id: 1, developmentMode: false, maintenanceMessage: 'The system is currently undergoing development. Please check back soon.' },
+    });
+    await settings.update({
+      developmentMode: req.body.developmentMode === true,
+      maintenanceMessage: String(req.body.maintenanceMessage || settings.maintenanceMessage).trim().slice(0, 300),
+      updatedBy: admin.id,
+    });
+    res.json({ message: 'Site availability updated', settings });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 // PRICING CONFIG
 // ════════════════════════════════════════════════════════════════════════════
 
-router.get('/pricing', requireAdmin, async (req, res) => {
+router.get('/pricing', requireAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const rows = await db.PriceConfig.findAll({ order: [['id', 'ASC']] });
     const preview = await calculatePrice({
@@ -346,7 +381,7 @@ router.get('/pricing', requireAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-router.patch('/pricing/:id', requireAdmin, async (req, res) => {
+router.patch('/pricing/:id', requireAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const row = await db.PriceConfig.findByPk(req.params.id);
     if (!row) return res.status(404).json({ error: 'Price config not found' });
@@ -366,7 +401,7 @@ router.patch('/pricing/:id', requireAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-router.post('/pricing/calculate', async (req, res) => {
+router.post('/pricing/calculate', requireAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { paperSize, subjectCount, frameType, pickupOption, isUrgent } = req.body;
     const result = await calculatePrice({ paperSize, subjectCount, frameType, pickupOption, isUrgent });

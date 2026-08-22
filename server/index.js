@@ -14,6 +14,7 @@ const sessionStore = new SequelizeSessionStore(db.AdminSession);
 
 
 const { ensurePriceCatalog } = require('./utils/pricing');
+const { runMigrations } = require('./migrations');
 
 const sessionSecret = process.env.SESSION_SECRET || '';
 const weakSessionSecret = sessionSecret.length < 32
@@ -105,6 +106,23 @@ const contentRouter = require('./routes/content');
 const customerNotificationsRouter = require('./routes/customerNotifications');
 
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
+app.use('/api', async (req, res, next) => {
+  const allowedDuringMaintenance = req.path.startsWith('/admin')
+    || req.path === '/content/site-settings'
+    || req.path === '/payments/payhere-notify'
+    || req.path === '/health';
+  if (allowedDuringMaintenance) return next();
+  try {
+    const settings = await db.SiteSetting.findByPk(1);
+    if (!settings?.developmentMode) return next();
+    return res.status(503).json({
+      code: 'SYSTEM_DEVELOPMENT',
+      error: settings.maintenanceMessage,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
 app.use('/api/customers', customerRouter);
 app.use('/api/payments',  paymentRouter);
 app.use('/api/admin',     adminAuthRouter); // POST /api/admin/login etc.
@@ -117,6 +135,7 @@ app.use('/api/customers/notifications', customerNotificationsRouter);
 // Create any missing tables once on startup without resetting existing data.
 db.sequelize.authenticate()
   .then(async () => {
+    await runMigrations(db);
     await ensurePriceCatalog();
     await sessionStore.clearExpired();
     startEmailQueueWorker();

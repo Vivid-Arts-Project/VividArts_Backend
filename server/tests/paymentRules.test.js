@@ -246,6 +246,7 @@ test('OTP expiry is rejected after the validity window', async () => {
   const originalDb = require.cache[require.resolve('../models')];
   const originalHelperDb = require.cache[require.resolve('../utils/otpHelper')];
   require.cache[require.resolve('../models')] = { exports: dbStub };
+  delete require.cache[require.resolve('../utils/otpHelper')];
   const { verifyOTP: verifyExpiredOTP } = require('../utils/otpHelper');
 
   await assert.rejects(() => verifyExpiredOTP('otp@example.com', '123456'), /expired/i);

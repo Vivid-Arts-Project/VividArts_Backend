@@ -21,6 +21,8 @@ module.exports = (sequelize) => {
     lastName:        { type: DataTypes.STRING(80), defaultValue: '' },
     email:           { type: DataTypes.STRING, allowNull: false, unique: true, validate: { isEmail: true } },
     phone:           { type: DataTypes.STRING(20), allowNull: true },
+    isSuperAdmin:    { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    isActive:        { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
     profileImageUrl: { type: DataTypes.STRING, allowNull: true },
     profileImagePublicId: { type: DataTypes.STRING, allowNull: true },
     businessName:    { type: DataTypes.STRING(120), defaultValue: 'Vivid Arts' },

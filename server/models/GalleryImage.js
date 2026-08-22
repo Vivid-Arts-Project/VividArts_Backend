@@ -1,6 +1,6 @@
 module.exports = (sequelize, DataTypes) => sequelize.define('GalleryImage', {
   id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
-  placement: { type: DataTypes.ENUM('home', 'gallery'), allowNull: false, defaultValue: 'gallery' },
+  placement: { type: DataTypes.ENUM('home', 'gallery', 'both'), allowNull: false, defaultValue: 'gallery' },
   title: { type: DataTypes.STRING(120), allowNull: false },
   subtitle: { type: DataTypes.STRING(120), allowNull: true },
   imageUrl: { type: DataTypes.STRING(500), allowNull: false },

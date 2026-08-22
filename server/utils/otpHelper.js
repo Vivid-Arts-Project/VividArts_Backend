@@ -69,7 +69,11 @@ const requestOTP = async (email, sendEmailFunction) => {
   recentRequests.push(now);
   requestTracker.set(identifier, recentRequests.slice(-MAX_REQUESTS_PER_WINDOW));
 
-  await sendEmailFunction(identifier, otp);
+  const delivery = await sendEmailFunction(identifier, otp);
+  if (delivery?.skipped) {
+    await db.VerificationToken.destroy({ where: { identifier, type: 'register' } });
+    throw new Error('Email verification is not configured. Please contact the administrator.');
+  }
   return { message: 'OTP sent successfully', code: otp };
 };
 
