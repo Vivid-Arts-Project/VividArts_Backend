@@ -2,8 +2,16 @@ const { DataTypes } = require('sequelize');
 const baseline = require('./001-baseline-and-repairs');
 const paymentIntegrity = require('./002-payment-integrity');
 const reviews = require('./003-reviews');
+const emailDeliveryQueue = require('./003-email-delivery-queue');
+const verificationTokens = require('./004-verification-tokens');
 
-const migrations = [baseline, paymentIntegrity, reviews];
+const migrations = [
+  baseline,
+  paymentIntegrity,
+  reviews,
+  emailDeliveryQueue,
+  verificationTokens,
+];
 
 async function runMigrations(db) {
   const Migration = db.sequelize.define('SchemaMigration', {

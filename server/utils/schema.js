@@ -109,4 +109,47 @@ async function ensureNotificationOrderIdColumn(sequelize) {
   }
 }
 
-module.exports = { ensureAdminProfileColumns, removeDuplicateUniqueIndexes, ensureCustomerProfileColumns, ensureOrderWorkflowColumns, ensureNotificationOrderIdColumn };
+async function ensureVerificationTokenTable(sequelize) {
+  const queryInterface = sequelize.getQueryInterface();
+  let columns;
+  try {
+    columns = await queryInterface.describeTable('verification_tokens');
+  } catch {
+    await queryInterface.createTable('verification_tokens', {
+      id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
+      identifier: { type: DataTypes.STRING, allowNull: false },
+      otp: { type: DataTypes.STRING, allowNull: false },
+      type: { type: DataTypes.STRING, allowNull: false, defaultValue: 'register' },
+      attempts: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+      expiresAt: { type: DataTypes.DATE, allowNull: false },
+      lastResentAt: { type: DataTypes.DATE, allowNull: true },
+      createdAt: { type: DataTypes.DATE, allowNull: false },
+      updatedAt: { type: DataTypes.DATE, allowNull: false },
+    });
+    return;
+  }
+
+  const requiredColumns = {
+    identifier: { type: DataTypes.STRING, allowNull: false },
+    otp: { type: DataTypes.STRING, allowNull: false },
+    type: { type: DataTypes.STRING, allowNull: false, defaultValue: 'register' },
+    attempts: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+    expiresAt: { type: DataTypes.DATE, allowNull: false },
+    lastResentAt: { type: DataTypes.DATE, allowNull: true },
+  };
+
+  for (const [columnName, definition] of Object.entries(requiredColumns)) {
+    if (!columns[columnName]) {
+      await queryInterface.addColumn('verification_tokens', columnName, definition);
+    }
+  }
+}
+
+module.exports = {
+  ensureAdminProfileColumns,
+  removeDuplicateUniqueIndexes,
+  ensureCustomerProfileColumns,
+  ensureOrderWorkflowColumns,
+  ensureNotificationOrderIdColumn,
+  ensureVerificationTokenTable,
+};

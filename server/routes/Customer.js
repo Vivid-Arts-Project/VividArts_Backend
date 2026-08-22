@@ -8,15 +8,13 @@ const { Customer, Notification } = require('../models');
 const { Op } = require('sequelize');
 const { sendEmail } = require('../middleware/email');
 const { protect } = require('../middleware/authMiddleware');
+const { requestOTP, verifyOTP } = require('../utils/otpHelper');
 
 const { uploadProfile, uploadProfileImage, uploadCover, deleteImage } = require('../middleware/upload');
 const { JWT_SECRET } = require('../config/auth');
 
 const OTP_LIFETIME_MS = 10 * 60 * 1000;
-const pendingEmailVerifications = new Map();
 const verifiedEmailTokens = new Map();
-
-const hashOtp = (email, code) => crypto.createHash('sha256').update(`${email}:${code}`).digest('hex');
 
 const createToken = (customer) => jwt.sign(
   { customerId: customer.customer_id, email: customer.email },
@@ -48,12 +46,11 @@ router.post('/register/send-otp', async (req, res) => {
       return res.status(409).json({ message: 'An account with this username or email already exists.' });
     }
 
-    const code = String(crypto.randomInt(100000, 1000000));
     const delivery = await sendEmail({
       to: email,
       subject: 'Your Vivid Arts verification code',
-      text: `Your Vivid Arts verification code is ${code}. It expires in 10 minutes.`,
-      html: `<p>Your Vivid Arts verification code is <strong style="font-size:20px;letter-spacing:3px">${code}</strong>.</p><p>This code expires in 10 minutes.</p>`,
+      text: 'Your Vivid Arts verification code is being prepared. Please use the code sent in the app response.',
+      html: '<p>Your Vivid Arts verification code is being prepared.</p>',
     });
 
     const isDevelopment = process.env.NODE_ENV === 'development';
@@ -61,53 +58,58 @@ router.post('/register/send-otp', async (req, res) => {
       return res.status(503).json({ message: 'Email verification is not configured. Add SMTP settings to the backend .env file.' });
     }
 
-    pendingEmailVerifications.set(email, {
-      username,
-      codeHash: hashOtp(email, code),
-      expiresAt: Date.now() + OTP_LIFETIME_MS,
-      attempts: 0,
+    const result = await requestOTP(email, async (recipient, code) => {
+      const emailPayload = {
+        to: recipient,
+        subject: 'Your Vivid Arts verification code',
+        text: `Your Vivid Arts verification code is ${code}. It expires in 10 minutes.`,
+        html: `<p>Your Vivid Arts verification code is <strong style="font-size:20px;letter-spacing:3px">${code}</strong>.</p><p>This code expires in 10 minutes.</p>`,
+      };
+      return sendEmail(emailPayload);
     });
-    if (delivery.skipped) {
-      console.warn(`[auth] Development verification code for ${email}: ${code}`);
+
+    if (isDevelopment) {
       return res.json({
         message: 'Development mode: use the verification code shown below.',
-        developmentCode: code,
+        developmentCode: result.code,
       });
     }
 
     res.json({ message: 'Verification code sent. Check your email.' });
   } catch (error) {
-    res.status(500).json({ message: 'Unable to send the verification code. Please try again.' });
+    const message = error?.message || 'Unable to send the verification code. Please try again.';
+    if (message.includes('Too many verification requests') || message.includes('Please wait')) {
+      return res.status(429).json({ message });
+    }
+    res.status(500).json({ message });
   }
 });
 
 // 🔑 2. VERIFY OTP CODE ROUTE
-router.post('/register/verify-otp', (req, res) => {
-  const email = String(req.body.email || '').trim().toLowerCase();
-  const code = String(req.body.code || '').trim();
-  const pending = pendingEmailVerifications.get(email);
+router.post('/register/verify-otp', async (req, res) => {
+  try {
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const code = String(req.body.code || '').trim();
 
-  if (!pending || pending.expiresAt < Date.now()) {
-    pendingEmailVerifications.delete(email);
-    return res.status(400).json({ message: 'This verification code has expired. Please request a new one.' });
-  }
-  if (pending.attempts >= 5) {
-    pendingEmailVerifications.delete(email);
-    return res.status(429).json({ message: 'Too many incorrect attempts. Please request a new code.' });
-  }
-  if (pending.codeHash !== hashOtp(email, code)) {
-    pending.attempts += 1;
-    return res.status(400).json({ message: 'Incorrect verification code.' });
-  }
+    const result = await verifyOTP(email, code);
+    const verificationToken = crypto.randomBytes(32).toString('hex');
+    verifiedEmailTokens.set(verificationToken, {
+      username: String(req.body.username || '').trim(),
+      email,
+      expiresAt: Date.now() + OTP_LIFETIME_MS,
+    });
 
-  const verificationToken = crypto.randomBytes(32).toString('hex');
-  verifiedEmailTokens.set(verificationToken, {
-    username: pending.username,
-    email,
-    expiresAt: Date.now() + OTP_LIFETIME_MS,
-  });
-  pendingEmailVerifications.delete(email);
-  res.json({ message: 'Email verified successfully.', verificationToken });
+    res.json({ message: result.message, verificationToken });
+  } catch (error) {
+    const message = error?.message || 'Incorrect verification code.';
+    if (message.includes('expired') || message.includes('No verification request')) {
+      return res.status(400).json({ message });
+    }
+    if (message.includes('Too many incorrect') || message.includes('Please request a new code.')) {
+      return res.status(429).json({ message });
+    }
+    res.status(400).json({ message });
+  }
 });
 
 // ✅ 3. COMPLETE REGISTER ROUTE
@@ -326,39 +328,6 @@ router.put('/profile', protect, async (req, res) => {
   }
 });
 
-// 🔔 NOTIFICATIONS APIS
-router.get('/notifications', protect, async (req, res) => {
-  try {
-    const { page, limit, offset } = paginationFrom(req.query);
-    const { count, rows: notifications } = await Notification.findAndCountAll({
-      where: { customerId: req.user.customerId },
-      order: [['createdAt', 'DESC']],
-      limit,
-      offset,
-    });
 
-    res.json({
-      success: true,
-      notifications,
-      pagination: paginationMeta(count, page, limit),
-    });
-  } catch (error) {
-    res.status(500).json({ message: error.message || 'Failed to fetch notifications.' });
-  }
-});
-
-router.put('/notifications/:id/read', protect, async (req, res) => {
-  try {
-    const updated = await Notification.update(
-      { isRead: true },
-      { where: { id: req.params.id, customerId: req.user.customerId } },
-    );
-    if (!updated[0]) return res.status(404).json({ message: 'Notification not found.' });
-
-    res.json({ success: true, message: 'Notification marked as read.' });
-  } catch (error) {
-    res.status(500).json({ message: error.message || 'Failed to update notification status.' });
-  }
-});
 
 module.exports = router;
