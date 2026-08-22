@@ -46,19 +46,7 @@ router.post('/register/send-otp', async (req, res) => {
       return res.status(409).json({ message: 'An account with this username or email already exists.' });
     }
 
-    const delivery = await sendEmail({
-      to: email,
-      subject: 'Your Vivid Arts verification code',
-      text: 'Your Vivid Arts verification code is being prepared. Please use the code sent in the app response.',
-      html: '<p>Your Vivid Arts verification code is being prepared.</p>',
-    });
-
-    const isDevelopment = process.env.NODE_ENV === 'development';
-    if (delivery.skipped && !isDevelopment) {
-      return res.status(503).json({ message: 'Email verification is not configured. Add SMTP settings to the backend .env file.' });
-    }
-
-    const result = await requestOTP(email, async (recipient, code) => {
+    await requestOTP(email, async (recipient, code) => {
       const emailPayload = {
         to: recipient,
         subject: 'Your Vivid Arts verification code',
@@ -67,13 +55,6 @@ router.post('/register/send-otp', async (req, res) => {
       };
       return sendEmail(emailPayload);
     });
-
-    if (isDevelopment) {
-      return res.json({
-        message: 'Development mode: use the verification code shown below.',
-        developmentCode: result.code,
-      });
-    }
 
     res.json({ message: 'Verification code sent. Check your email.' });
   } catch (error) {

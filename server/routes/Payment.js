@@ -904,7 +904,10 @@ router.get('/', requireAdmin, async (req, res) => {
         include: [{
           model: db.Order,
           as: 'order',
-          include: [{ model: db.Customer, as: 'customer' }],
+          include: [
+            { model: db.Customer, as: 'customer', attributes: ['customer_id', 'full_name', 'username', 'email'] },
+            { model: db.ProductOption, as: 'productOption', attributes: ['paper_size', 'num_subjects', 'frame_type'] },
+          ],
         }],
         order: [['createdAt', 'DESC']],
         distinct: true,
