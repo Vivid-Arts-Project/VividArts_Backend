@@ -616,23 +616,23 @@ router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
     }
 
     // Notification එක සෑදීම
-    let title = '📌 Order Status Updated';
+    let title = 'Order Status Updated';
     let message = customMessage || `Your order status has been updated to ${status}.`;
 
     if (status === 'sketching') {
-      title = '🎨 Artist Started Sketching!';
+      title = 'Artist Started Sketching!';
       message = customMessage || 'Our artist has started working on your pencil portrait!';
     } else if (status === 'waiting_for_feedback') {
-      title = '🖼️ Portrait Proof Ready!';
+      title = 'Portrait Proof Ready!';
       message = customMessage || 'Your portrait drawing is complete! Please review the proof image.';
     } else if (status === 'finished' || status === 'framed') {
-      title = '✨ Portrait Finished & Framed!';
+      title = 'Portrait Finished & Framed!';
       message = customMessage || 'Your portrait drawing is completed and framed perfectly.';
     } else if (status === 'shipped') {
-      title = '📦 Order Dispatched / Ready!';
+      title = 'Order Dispatched / Ready!';
       message = customMessage || 'Your portrait package is on its way or ready for pickup!';
     } else if (status === 'done') {
-      title = '🎉 Order Completed!';
+      title = 'Order Completed!';
       message = customMessage || 'Your portrait order has been delivered and completed!';
     }
 
@@ -694,7 +694,7 @@ router.post('/orders/:id/proof', requireAdmin, (req, res) => {
         await createNotification(
           order.customer_id,
           order.order_id,
-          '🖼️ New Proof Image Uploaded',
+          'New Proof Image Uploaded',
           'The artist has uploaded a proof of your portrait! Please check and give feedback.',
           'waiting_for_feedback',
           { transaction }
