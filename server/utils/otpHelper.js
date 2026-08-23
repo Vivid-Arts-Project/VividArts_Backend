@@ -19,7 +19,7 @@ const getRecentRequestTimes = (identifier) => {
 };
 
 // Generate and save OTP with resend cooldown protection
-const requestOTP = async (email, sendEmailFunction) => {
+const requestOTP = async (email, sendEmailFunction, type = 'register') => {
   const identifier = String(email || '').trim().toLowerCase();
   if (!identifier) {
     throw new Error('Email is required to request a verification code.');
@@ -32,7 +32,7 @@ const requestOTP = async (email, sendEmailFunction) => {
   }
 
   let record = await db.VerificationToken.findOne({
-    where: { identifier, type: 'register' },
+    where: { identifier, type },
   });
 
   if (record) {
@@ -59,7 +59,7 @@ const requestOTP = async (email, sendEmailFunction) => {
     await db.VerificationToken.create({
       identifier,
       otp: otpHash,
-      type: 'register',
+      type,
       attempts: 0,
       expiresAt,
       lastResentAt: new Date(now),
@@ -70,11 +70,11 @@ const requestOTP = async (email, sendEmailFunction) => {
   try {
     delivery = await sendEmailFunction(identifier, otp);
   } catch (error) {
-    await db.VerificationToken.destroy({ where: { identifier, type: 'register' } });
+    await db.VerificationToken.destroy({ where: { identifier, type } });
     throw error;
   }
   if (delivery?.skipped) {
-    await db.VerificationToken.destroy({ where: { identifier, type: 'register' } });
+    await db.VerificationToken.destroy({ where: { identifier, type } });
     throw new Error('Email verification is not configured. Please contact the administrator.');
   }
   recentRequests.push(now);
@@ -83,12 +83,12 @@ const requestOTP = async (email, sendEmailFunction) => {
 };
 
 // Verify the submitted OTP with attempt limiting and expiry checks
-const verifyOTP = async (email, enteredOtp) => {
+const verifyOTP = async (email, enteredOtp, type = 'register') => {
   const identifier = String(email || '').trim().toLowerCase();
   const submittedOtp = String(enteredOtp || '').trim();
 
   const record = await db.VerificationToken.findOne({
-    where: { identifier, type: 'register' },
+    where: { identifier, type },
   });
 
   if (!record) {

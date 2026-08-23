@@ -5,6 +5,7 @@ const { createAdminNotification } = require('../utils/adminNotificationHelper');
 const { uploadProfile, uploadProfileImage, deleteImage } = require('../middleware/upload');
 const adminLoginLimiter = require('../middleware/adminLoginLimiter');
 const { sendEmail } = require('../middleware/email');
+const bcrypt = require('bcrypt');
 
 // ── POST /api/admin/register ──────────────────────────────────────────────────
 // The first administrator bootstraps the system. Once one exists, only an
@@ -57,7 +58,7 @@ router.post('/register', async (req, res) => {
         metadata: { type: 'admin_registration_request', requestId: request.id },
       });
     }));
-    res.status(202).json({ message: 'Your administrator request was submitted for approval.', requestId: request.id, approved: false });
+    res.status(202).json({ message: 'Your administrator request was submitted for approval.', requestId: request.id, requestToken: request.requestToken, approved: false });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -72,6 +73,21 @@ router.post('/login', adminLoginLimiter, async (req, res) => {
     }
 
     const admin = await db.Admin.findOne({ where: { username } });
+    if (!admin) {
+      const request = await db.AdminRegistrationRequest.findOne({
+        where: { username },
+        order: [['createdAt', 'DESC']],
+      });
+      if (request && await bcrypt.compare(password, request.passwordHash)) {
+        req.adminLoginAttempt.succeeded();
+        return res.status(403).json({
+          error: request.status === 'pending' ? 'Your administrator request is waiting for approval.' : 'Your administrator request was rejected.',
+          code: request.status === 'pending' ? 'ADMIN_APPROVAL_PENDING' : 'ADMIN_REQUEST_REJECTED',
+          requestToken: request.requestToken,
+          status: request.status,
+        });
+      }
+    }
     if (!admin || !admin.isActive || !(await admin.checkPassword(password))) {
       req.adminLoginAttempt.failed();
       return res.status(401).json({ error: 'Invalid username or password' });
@@ -128,6 +144,26 @@ router.patch('/profile', requireAdmin, async (req, res) => {
     await admin.update({ firstName, lastName, email, phone });
     res.json({ message: 'Profile updated', admin: safeAdmin(admin) });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Public, token-scoped status used by the applicant waiting screen. The random
+// token is the only lookup key and no password hash or contact details leave the API.
+router.get('/registration-request-status/:token', async (req, res) => {
+  try {
+    const token = String(req.params.token || '');
+    if (!/^[a-f0-9]{64}$/i.test(token)) return res.status(404).json({ error: 'Administrator request not found' });
+    const request = await db.AdminRegistrationRequest.findOne({ where: { requestToken: token } });
+    if (!request) return res.status(404).json({ error: 'Administrator request not found' });
+    res.json({
+      status: request.status,
+      username: request.username,
+      firstName: request.firstName || '',
+      decisionNote: request.status === 'rejected' ? request.decisionNote : null,
+      reviewedAt: request.reviewedAt,
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Unable to check administrator request status' });
+  }
 });
 
 router.get('/registration-requests', requireAdmin, async (req, res) => {
