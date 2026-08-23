@@ -35,10 +35,13 @@ app.use((req, res, next) => {
   res.json = body => {
     if (res.statusCode < 500 || !body || typeof body !== 'object') return sendJson(body);
     console.error(`[api-error] ${req.method} ${req.originalUrl}:`, body.error || body.message || 'Internal server error');
+    const publicMessage = typeof body.publicMessage === 'string' && body.publicMessage.trim()
+      ? body.publicMessage.trim()
+      : 'Unable to complete this request.';
     return sendJson({
       ...(Object.hasOwn(body, 'success') ? { success: false } : {}),
-      ...(Object.hasOwn(body, 'message') ? { message: 'Unable to complete this request.' } : {}),
-      error: 'Unable to complete this request.',
+      ...(Object.hasOwn(body, 'message') || body.publicMessage ? { message: publicMessage } : {}),
+      error: publicMessage,
     });
   };
   next();
