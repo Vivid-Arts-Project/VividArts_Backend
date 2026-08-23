@@ -75,6 +75,7 @@ router.get('/my-orders', protect, async (req, res) => {
           amount: Number(payment.amount || 0),
           currency: payment.currency,
           method: payment.paymentMethod,
+          paymentType: payment.paymentType,
           status: payment.status,
           transactionId: payment.transactionId || payment.payherePaymentId,
           createdAt: payment.createdAt,
@@ -430,30 +431,30 @@ router.post('/update-status', async (req, res) => {
 
     switch (String(status).toUpperCase()) {
       case 'CONFIRMED':
-        title = 'Order Confirmed! 🎉';
+        title = 'Order Confirmed!';
         message = `Your order #${orderId} has been confirmed. The artist is getting ready!`;
         break;
       case 'SKETCHING_HALF':
       case 'IN_PROGRESS':
-        title = 'Drawing in Progress (50%) ✏️';
+        title = 'Drawing in Progress (50%)';
         message = `Your portrait #${orderId} is half-way done! Outline & basic shading completed.`;
         break;
       case 'COMPLETED':
       case 'DRAWING_FINISHED':
-        title = 'Drawing Fully Completed! 🎨';
+        title = 'Drawing Fully Completed!';
         message = `Great news! The artist finished your portrait #${orderId}.`;
         break;
       case 'PACKED':
-        title = 'Framed & Packed 📦';
+        title = 'Framed & Packed';
         message = `Your portrait #${orderId} has been safely framed and packed for delivery.`;
         break;
       case 'DISPATCHED':
       case 'OUT_FOR_DELIVERY':
-        title = 'Out for Delivery! 🚚';
+        title = 'Out for Delivery!';
         message = `Your package #${orderId} is now with the courier and on its way to you!`;
         break;
       case 'DELIVERED':
-        title = 'Delivered! 🎁';
+        title = 'Delivered!';
         message = `Your order #${orderId} has been delivered successfully. Thank you!`;
         break;
       default:

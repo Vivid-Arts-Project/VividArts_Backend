@@ -611,7 +611,25 @@ router.post('/orders/:id/balance-checkout', requireCustomer, async (req, res) =>
       phone: order.customer?.phone_number || '0771234567',
       address: order.customer?.address || 'Colombo', city: 'Colombo', country: 'Sri Lanka', hash,
     };
-    await payment.update({ payhereMd5sig: hash, metadata: { balancePayment: true, checkoutAmount: gatewayAmount, checkoutCurrency: currency } });
+    const customerDetails = {
+      firstName: firstName || 'Vivid',
+      lastName: lastNameParts.join(' ') || '-',
+      email: order.customer?.email,
+      phone: order.customer?.phone_number,
+      address: order.customer?.address,
+      city: 'Colombo',
+      country: 'Sri Lanka',
+    };
+    await payment.update({
+      payhereMd5sig: hash,
+      metadata: {
+        ...(payment.metadata || {}),
+        balancePayment: true,
+        checkoutAmount: gatewayAmount,
+        checkoutCurrency: currency,
+        customer: customerDetails,
+      },
+    });
     res.status(201).json({ success: true, checkoutUrl: PAYHERE_CHECKOUT_URL, checkoutFields, orderId: payment.payhereOrderId });
   } catch (error) {
     console.error('Error creating balance checkout:', error);
