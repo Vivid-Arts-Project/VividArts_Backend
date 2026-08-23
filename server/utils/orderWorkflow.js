@@ -13,9 +13,9 @@ function allowedTransitions(status, product = {}) {
   const usesCourier = product.pickup_option === 'courier';
   const transitions = {
     in_queue: ['in_queue', 'sketching'],
-    sketching: ['sketching'],
-    waiting_for_feedback: ['waiting_for_feedback'],
-    revision_requested: ['revision_requested'],
+    sketching: ['sketching', 'waiting_for_feedback'],
+    waiting_for_feedback: ['waiting_for_feedback', 'sketching', 'revision_requested', 'approved'],
+    revision_requested: ['revision_requested', 'sketching', 'waiting_for_feedback'],
     approved: ['approved', ...(hasFrame ? ['framed'] : usesCourier ? ['shipped'] : ['done'])],
     framed: ['framed', ...(usesCourier ? ['shipped'] : ['done'])],
     shipped: ['shipped', 'done'],

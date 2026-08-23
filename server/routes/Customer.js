@@ -6,7 +6,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { Customer, Notification } = require('../models');
 const { Op } = require('sequelize');
-const { sendEmail } = require('../middleware/email');
+const { sendEmailNow } = require('../middleware/email');
 const { protect } = require('../middleware/authMiddleware');
 const { requestOTP, verifyOTP } = require('../utils/otpHelper');
 
@@ -53,16 +53,20 @@ router.post('/register/send-otp', async (req, res) => {
         text: `Your Vivid Arts verification code is ${code}. It expires in 10 minutes.`,
         html: `<p>Your Vivid Arts verification code is <strong style="font-size:20px;letter-spacing:3px">${code}</strong>.</p><p>This code expires in 10 minutes.</p>`,
       };
-      return sendEmail(emailPayload);
+      return sendEmailNow(emailPayload);
     });
 
     res.json({ message: 'Verification code sent. Check your email.' });
   } catch (error) {
+    console.error('[registration OTP] Email delivery failed:', error.code || error.message);
     const message = error?.message || 'Unable to send the verification code. Please try again.';
     if (message.includes('Too many verification requests') || message.includes('Please wait')) {
       return res.status(429).json({ message });
     }
-    res.status(500).json({ message });
+    res.status(503).json({
+      publicMessage: 'Email delivery is unavailable. Please check the studio email configuration and try again.',
+      message: 'Unable to deliver the verification email.',
+    });
   }
 });
 
@@ -71,11 +75,12 @@ router.post('/register/verify-otp', async (req, res) => {
   try {
     const email = String(req.body.email || '').trim().toLowerCase();
     const code = String(req.body.code || '').trim();
+    const username = String(req.body.username || '').trim();
 
     const result = await verifyOTP(email, code);
     const verificationToken = crypto.randomBytes(32).toString('hex');
     verifiedEmailTokens.set(verificationToken, {
-      username: String(req.body.username || '').trim(),
+      username,
       email,
       expiresAt: Date.now() + OTP_LIFETIME_MS,
     });
@@ -120,7 +125,12 @@ router.post('/register', async (req, res) => {
     }
 
     const verifiedEmail = verifiedEmailTokens.get(verificationToken);
-    if (!verifiedEmail || verifiedEmail.expiresAt < Date.now() || verifiedEmail.email !== normalizedEmail || verifiedEmail.username !== normalizedUsername) {
+    if (
+      !verifiedEmail ||
+      verifiedEmail.expiresAt < Date.now() ||
+      verifiedEmail.email !== normalizedEmail ||
+      (verifiedEmail.username && verifiedEmail.username !== normalizedUsername)
+    ) {
       return res.status(403).json({ message: 'Please verify your email address before creating an account.' });
     }
 

@@ -43,7 +43,9 @@ function createTransporter() {
     secure: process.env.SMTP_SECURE === 'true' || port === 465,
     auth: {
       user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
+      // Google displays app passwords in four groups; whitespace is only for
+      // readability and must not be sent as part of the SMTP credential.
+      pass: process.env.SMTP_PASS.replace(/\s/g, ''),
     },
   });
 }
@@ -244,6 +246,22 @@ async function sendEmail({ to, subject, text, html, metadata = {} }) {
   }
 }
 
+// Verification codes must be accepted by the SMTP provider before the API can
+// tell the customer that an email was sent. Other application emails continue
+// to use the durable retry queue above.
+async function sendEmailNow({ to, subject, text, html, transport = null }) {
+  if (!to) throw new Error('Cannot send email without a recipient address');
+  const activeTransport = transport || createTransporter();
+  const result = await activeTransport.sendMail({
+    from: process.env.EMAIL_FROM || process.env.SMTP_USER,
+    to,
+    subject,
+    text,
+    html,
+  });
+  return { sent: true, queued: false, messageId: result.messageId || null };
+}
+
 function getEligibleAdminRecipients(admins = [], preferenceKey = 'revisionRequested') {
   return (admins || []).filter((admin) => {
     const preferences = admin?.notifPreferences || {};
@@ -391,6 +409,7 @@ async function sendThankYouEmail(email, customerName, orderId) {
 
 module.exports = {
   sendEmail,
+  sendEmailNow,
   enqueueEmailDelivery,
   processEmailQueue,
   startEmailQueueWorker,

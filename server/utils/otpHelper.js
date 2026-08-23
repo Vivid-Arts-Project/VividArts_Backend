@@ -66,14 +66,19 @@ const requestOTP = async (email, sendEmailFunction) => {
     });
   }
 
-  recentRequests.push(now);
-  requestTracker.set(identifier, recentRequests.slice(-MAX_REQUESTS_PER_WINDOW));
-
-  const delivery = await sendEmailFunction(identifier, otp);
+  let delivery;
+  try {
+    delivery = await sendEmailFunction(identifier, otp);
+  } catch (error) {
+    await db.VerificationToken.destroy({ where: { identifier, type: 'register' } });
+    throw error;
+  }
   if (delivery?.skipped) {
     await db.VerificationToken.destroy({ where: { identifier, type: 'register' } });
     throw new Error('Email verification is not configured. Please contact the administrator.');
   }
+  recentRequests.push(now);
+  requestTracker.set(identifier, recentRequests.slice(-MAX_REQUESTS_PER_WINDOW));
   return { message: 'OTP sent successfully', code: otp };
 };
 
