@@ -9,7 +9,7 @@ const { getCatalog, calculateOrder } = require('../utils/pricing');
 const { protect } = require('../middleware/authMiddleware');
 const { uploadReferences, deleteImage } = require('../middleware/upload');
 const { createAdminNotification } = require('../utils/adminNotificationHelper');
-const { ACTIVE_STATUSES, buildTimelinePreview } = require('../utils/scheduling');
+const { ACTIVE_STATUSES, buildTimelinePreview, hasScheduledSlotConflict, requiredScheduledStart } = require('../utils/scheduling');
 const { balanceCheckoutDecision, paymentCallbackDecision, paymentSummary } = require('../utils/paymentRules');
 
 const requireAdmin = (req, res, next) => {
@@ -79,9 +79,13 @@ const PAYHERE_ALLOWED_CURRENCIES = (process.env.PAYHERE_ALLOWED_CURRENCIES || 'L
   .filter(Boolean);
 
 const createOrderId = () => `ORD-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+const localDateOnly = (date) => date
+  ? `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+  : null;
 
 const URGENT_ORDER_LIMIT = 2;
 const URGENT_WINDOW_DAYS = 10;
+const SCHEDULED_WINDOW_DAYS = 15;
 
 const getUrgentAvailability = async (transaction) => {
   const windowStart = new Date();
@@ -113,19 +117,44 @@ const assertUrgentAvailability = async (computedOrder, transaction) => {
   }
 };
 
+const assertScheduledAvailability = async (computedOrder, transaction) => {
+  if (!computedOrder.scheduled) return;
+  const orders = await db.Order.findAll({
+    where: { status: { [db.Sequelize.Op.in]: ACTIVE_STATUSES }, amount_paid: { [db.Sequelize.Op.gt]: 0 } },
+    include: [{ model: db.ProductOption, as: 'productOption' }],
+    transaction,
+  });
+  const timeline = buildTimelinePreview(orders, computedOrder);
+  const conflictingOrder = hasScheduledSlotConflict(orders, computedOrder, SCHEDULED_WINDOW_DAYS);
+  if (!timeline.feasible || conflictingOrder) {
+    const message = conflictingOrder
+      ? 'Scheduled-order availability for this 15-day production period is full. Please select a later date.'
+      : timeline.unavailableReason;
+    const error = new Error(message);
+    error.statusCode = 409;
+    error.code = 'SCHEDULED_DATE_UNAVAILABLE';
+    throw error;
+  }
+  return { timeline, slotAvailable: true };
+};
+
 const createCommission = async (req, computedOrder, payment) => {
   const customerId = req.customerId;
   return db.sequelize.transaction(async transaction => {
     await assertUrgentAvailability(computedOrder, transaction);
+    await assertScheduledAvailability(computedOrder, transaction);
     const product = await db.ProductOption.create({
       paper_size: computedOrder.sizeId, num_subjects: computedOrder.people,
       frame_type: computedOrder.frameId === 'none' ? 'without_frame' : computedOrder.frameId === 'premium' ? 'wooden_frame' : 'plastic_frame',
       pickup_option: computedOrder.deliveryMethod, is_urgent: computedOrder.urgent,
-      urgent_deadline: computedOrder.urgentDeadline, customer_note: computedOrder.notes,
+      urgent_deadline: computedOrder.urgentDeadline, is_scheduled: computedOrder.scheduled,
+      scheduled_date: computedOrder.scheduledDate,
+      scheduled_start_date: computedOrder.scheduled ? localDateOnly(requiredScheduledStart(computedOrder)) : null,
+      customer_note: computedOrder.notes,
     }, { transaction });
     const order = await db.Order.create({ customer_id: customerId, product_id: product.product_id,
       calculated_price: computedOrder.total, payment_type: 'advance', amount_paid: 0,
-      status: 'in_queue', is_urgent: computedOrder.urgent }, { transaction });
+      status: 'in_queue', is_urgent: computedOrder.urgent, is_scheduled: computedOrder.scheduled }, { transaction });
     await payment.update({ order_id: order.order_id }, { transaction });
     return order;
   });
@@ -246,9 +275,11 @@ const completeInitialOrderPayment = async (payment) => {
   const computedOrder = payment.metadata?.order || {};
   await createAdminNotification({
     orderId: payment.order_id,
-    type: 'order',
-    title: 'New portrait order',
-    message: `A new ${computedOrder.sizeLabel || computedOrder.sizeId || ''} portrait order was paid and confirmed.`.replace('new  portrait', 'new portrait'),
+    type: computedOrder.scheduled ? 'scheduled_order' : 'order',
+    title: computedOrder.scheduled ? 'New scheduled portrait order' : 'New portrait order',
+    message: computedOrder.scheduled
+      ? `A scheduled portrait order was confirmed for ${computedOrder.scheduledDate}. Its production slot has been reserved.`
+      : `A new ${computedOrder.sizeLabel || computedOrder.sizeId || ''} portrait order was paid and confirmed.`.replace('new  portrait', 'new portrait'),
   });
 };
 
@@ -315,6 +346,7 @@ router.post('/create-order', requireCustomer, async (req, res) => {
     const { currency, paymentMethod, bankDetails, order, customer = {} } = req.body;
     const computedOrder = await calculateOrder(order);
     await assertUrgentAvailability(computedOrder);
+    await assertScheduledAvailability(computedOrder);
 
     const orderData = {
       payhereOrderId: createOrderId(),
@@ -384,6 +416,7 @@ router.post('/create-payhere-checkout', requireCustomer, async (req, res) => {
 
     const computedOrder = await calculateOrder(order);
     await assertUrgentAvailability(computedOrder);
+    await assertScheduledAvailability(computedOrder);
     const payment = await Payment.create({
       payhereOrderId: createOrderId(),
       amount: computedOrder.dueAmount,
@@ -442,6 +475,7 @@ router.post('/orders/:id/resume-checkout', requireCustomer, async (req, res) => 
       include: [
         { model: db.Payment, as: 'payments' },
         { model: db.Customer, as: 'customer' },
+        { model: db.ProductOption, as: 'productOption' },
       ],
     });
     if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
@@ -508,10 +542,32 @@ router.post('/timeline-preview', requireCustomer, async (req, res) => {
     const proposedOrder = {
       urgent: req.body?.urgent === true,
       urgentDeadline: req.body?.urgentDeadline || null,
+      scheduled: req.body?.scheduled === true,
+      scheduledDate: req.body?.scheduledDate || null,
       people: req.body?.people,
+      frameId: req.body?.frameId,
       deliveryMethod: req.body?.deliveryMethod === 'pickup' ? 'pickup' : 'courier',
     };
-    res.json({ success: true, timeline: buildTimelinePreview(orders, proposedOrder) });
+    const timeline = buildTimelinePreview(orders, proposedOrder);
+    if (proposedOrder.scheduled && timeline.requiredStart) {
+      const conflict = hasScheduledSlotConflict(orders, proposedOrder, SCHEDULED_WINDOW_DAYS);
+      if (conflict) {
+        timeline.feasible = false;
+        timeline.slotAvailable = false;
+        timeline.unavailableReason = 'Scheduled-order availability for this 15-day production period is full. Please select a later date.';
+      } else timeline.slotAvailable = true;
+      timeline.scheduledWindowDays = SCHEDULED_WINDOW_DAYS;
+    }
+    if (order.is_scheduled || order.productOption?.is_scheduled) {
+      await assertScheduledAvailability({
+        scheduled: true,
+        scheduledDate: order.productOption?.scheduled_date,
+        people: order.productOption?.num_subjects,
+        frameId: order.productOption?.frame_type,
+        deliveryMethod: order.productOption?.pickup_option,
+      });
+    }
+    res.json({ success: true, timeline });
   } catch (error) {
     console.error('Error calculating timeline preview:', error);
     res.status(500).json({ success: false, error: 'Failed to calculate the estimated timeline' });

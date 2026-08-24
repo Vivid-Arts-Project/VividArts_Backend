@@ -211,6 +211,50 @@ router.post('/logout', (_req, res) => {
   res.json({ message: 'Logged out.' });
 });
 
+router.post('/forgot-password/send-otp', async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  if (!email) return res.status(400).json({ message: 'Email is required.' });
+  try {
+    const customer = await Customer.findOne({ where: { email } });
+    if (customer) {
+      await requestOTP(email, (recipient, code) => sendEmailNow({
+        to: recipient,
+        subject: 'Reset your Vivid Arts password',
+        text: `Your Vivid Arts password reset code is ${code}. It expires in 10 minutes.`,
+        html: `<p>Your Vivid Arts password reset code is <strong style="font-size:20px;letter-spacing:3px">${code}</strong>.</p><p>This code expires in 10 minutes. If you did not request this, you can ignore this email.</p>`,
+      }), 'password_reset');
+    }
+    res.json({ message: 'If an account uses that email, a verification code has been sent.' });
+  } catch (error) {
+    const message = error?.message || '';
+    if (message.includes('Too many verification requests') || message.includes('Please wait')) {
+      return res.status(429).json({ message });
+    }
+    console.error('[password reset OTP] Email delivery failed:', error.code || error.message);
+    res.status(503).json({ message: 'Unable to deliver the verification email. Please try again later.' });
+  }
+});
+
+router.post('/forgot-password/reset', async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const code = String(req.body.code || '').trim();
+  const { newPassword, confirmPassword } = req.body;
+  if (!email || !code || !newPassword || !confirmPassword) return res.status(400).json({ message: 'Email, verification code, and both password fields are required.' });
+  if (newPassword !== confirmPassword) return res.status(400).json({ message: 'Passwords do not match.' });
+  if (newPassword.length < 8) return res.status(400).json({ message: 'Password must be at least 8 characters long.' });
+  try {
+    const customer = await Customer.findOne({ where: { email } });
+    if (!customer) return res.status(400).json({ message: 'Invalid or expired verification request.' });
+    await verifyOTP(email, code, 'password_reset');
+    const rounds = parseInt(process.env.BCRYPT_ROUNDS, 10) || 4;
+    await customer.update({ password_hash: await bcrypt.hash(newPassword, rounds) });
+    res.clearCookie('vividarts.customer.token', { httpOnly: true, secure: customerCookieOptions.secure, sameSite: customerCookieOptions.sameSite, path: '/' });
+    res.json({ message: 'Password reset successfully. You can now sign in.' });
+  } catch (error) {
+    res.status(400).json({ message: error?.message || 'Unable to reset password.' });
+  }
+});
+
 // 👤 PROFILE ROUTES
 router.get('/profile', protect, async (req, res) => {
   try {
@@ -316,6 +360,23 @@ router.put('/profile', protect, async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ message: error.message || 'Unable to update profile.' });
+  }
+});
+
+router.patch('/password', protect, async (req, res) => {
+  try {
+    const customer = await Customer.findByPk(req.user.customerId);
+    if (!customer) return res.status(404).json({ message: 'Customer not found.' });
+    const { currentPassword, newPassword, confirmPassword } = req.body;
+    if (!currentPassword || !newPassword || !confirmPassword) return res.status(400).json({ message: 'All password fields are required.' });
+    if (newPassword !== confirmPassword) return res.status(400).json({ message: 'New passwords do not match.' });
+    if (newPassword.length < 8) return res.status(400).json({ message: 'New password must be at least 8 characters long.' });
+    if (!(await bcrypt.compare(currentPassword, customer.password_hash))) return res.status(400).json({ message: 'Current password is incorrect.' });
+    const rounds = parseInt(process.env.BCRYPT_ROUNDS, 10) || 4;
+    await customer.update({ password_hash: await bcrypt.hash(newPassword, rounds) });
+    res.json({ message: 'Password updated successfully.' });
+  } catch (error) {
+    res.status(500).json({ message: 'Unable to update password. Please try again.' });
   }
 });
 

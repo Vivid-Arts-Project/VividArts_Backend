@@ -166,6 +166,7 @@ async function renderInvoice(doc, payment) {
     ...(order.peoplePrice > 0 ? [[`Extra subjects (${(order.people || 1) - 1})`, money(order.peoplePrice, payment.currency)]] : []),
     ...(order.deliveryPrice > 0 ? [['Delivery', money(order.deliveryPrice, payment.currency)]] : []),
     ...(order.urgentPrice > 0 ? [['Urgent order', money(order.urgentPrice, payment.currency)]] : []),
+    ...(order.scheduledPrice > 0 ? [['Scheduled order', money(order.scheduledPrice, payment.currency)]] : []),
   ];
 
   let rowY = tableTop + 26;

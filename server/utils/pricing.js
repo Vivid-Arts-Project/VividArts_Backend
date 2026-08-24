@@ -12,6 +12,7 @@ const DEFAULT_PRICE_ROWS = [
   { category: 'FRAME', itemKey: 'FRAME_PREMIUM_A3', description: 'A3 premium frame', price: 2400 },
   { category: 'SERVICE', itemKey: 'DELIVERY_STANDARD', description: 'Delivery charge', price: 500 },
   { category: 'SERVICE', itemKey: 'URGENT_ORDER', description: 'Urgent order charge', price: 500 },
+  { category: 'SERVICE', itemKey: 'SCHEDULED_ORDER', description: 'Scheduled order charge', price: 200 },
 ];
 
 let catalogReadyPromise;
@@ -51,6 +52,7 @@ async function getCatalog() {
     },
     deliveryPrice: p.DELIVERY_STANDARD ?? 0,
     urgentPrice: p.URGENT_ORDER ?? 0,
+    scheduledPrice: p.SCHEDULED_ORDER ?? 0,
   };
 }
 
@@ -61,6 +63,7 @@ async function calculateOrder(order = {}) {
   const rawPeople = Number(order.people);
   const people = Number.isFinite(rawPeople) && rawPeople >= 1 ? Math.min(Math.floor(rawPeople), 10) : 1;
   const urgent = order.urgent === true || order.isUrgent === true;
+  const scheduled = !urgent && (order.scheduled === true || order.isScheduled === true);
   const urgentDeadline = urgent && /^\d{4}-\d{2}-\d{2}$/.test(order.urgentDeadline || '')
     ? order.urgentDeadline
     : null;
@@ -79,6 +82,19 @@ async function calculateOrder(order = {}) {
       throw error;
     }
   }
+  const scheduledDate = scheduled && /^\d{4}-\d{2}-\d{2}$/.test(order.scheduledDate || '')
+    ? order.scheduledDate
+    : null;
+  if (scheduled) {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const requested = scheduledDate ? new Date(`${scheduledDate}T00:00:00`) : null;
+    if (!requested || Number.isNaN(requested.getTime()) || requested <= today) {
+      const error = new Error('Scheduled orders require a valid future delivery or pickup date.');
+      error.statusCode = 400;
+      throw error;
+    }
+  }
   const deliveryMethod = order.deliveryMethod === 'pickup' ? 'pickup' : 'courier';
   const deliveryAddress = deliveryMethod === 'courier' && typeof order.deliveryAddress === 'string'
     ? order.deliveryAddress.trim().slice(0, 300)
@@ -91,11 +107,13 @@ async function calculateOrder(order = {}) {
   const peoplePrice = (people - 1) * extraPersonPrice;
   const deliveryPrice = deliveryMethod === 'courier' ? catalog.deliveryPrice : 0;
   const urgentPrice = urgent ? catalog.urgentPrice : 0;
-  const total = basePrice + framePrice + peoplePrice + deliveryPrice + urgentPrice;
+  const scheduledPrice = scheduled ? catalog.scheduledPrice : 0;
+  const total = basePrice + framePrice + peoplePrice + deliveryPrice + urgentPrice + scheduledPrice;
 
   return {
-    sizeId, sizeLabel: size.label, frameId, frameLabel: frame.label, people, deliveryMethod, deliveryAddress, urgent, urgentDeadline,
-    basePrice, extraPersonPrice, framePrice, peoplePrice, deliveryPrice, urgentPrice,
+    sizeId, sizeLabel: size.label, frameId, frameLabel: frame.label, people, deliveryMethod, deliveryAddress,
+    urgent, urgentDeadline, scheduled, scheduledDate,
+    basePrice, extraPersonPrice, framePrice, peoplePrice, deliveryPrice, urgentPrice, scheduledPrice,
     total, dueAmount: Math.round(total * 0.5),
     notes: typeof order.notes === 'string' ? order.notes.slice(0, 500) : '',
   };

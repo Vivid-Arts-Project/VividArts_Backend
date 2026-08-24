@@ -49,6 +49,18 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.DATEONLY,
       allowNull: true,
     },
+    is_scheduled: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+    scheduled_date: {
+      type: DataTypes.DATEONLY,
+      allowNull: true,
+    },
+    scheduled_start_date: {
+      type: DataTypes.DATEONLY,
+      allowNull: true,
+    },
 
     // ── Any special note or instruction from the customer ─────────────────────
     customer_note: {
