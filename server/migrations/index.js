@@ -7,6 +7,7 @@ const verificationTokens = require('./004-verification-tokens');
 const adminControlsAndSiteSettings = require('./005-admin-controls-and-site-settings');
 const existingTableControls = require('./006-existing-table-controls');
 const adminAccountStatus = require('./007-admin-account-status');
+const scheduledOrders = require('./008-scheduled-orders');
 
 const migrations = [
   baseline,
@@ -17,6 +18,7 @@ const migrations = [
   adminControlsAndSiteSettings,
   existingTableControls,
   adminAccountStatus,
+  scheduledOrders,
 ];
 
 async function runMigrations(db) {

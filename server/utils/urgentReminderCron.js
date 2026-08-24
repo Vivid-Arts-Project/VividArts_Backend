@@ -40,6 +40,20 @@ const resolveUrgentReminder = (order, today) => {
   return null;
 };
 
+const resolveScheduledReminder = (order, today) => {
+  const scheduledDate = order?.productOption?.scheduled_date;
+  if (!scheduledDate) return null;
+  const dueDate = new Date(`${scheduledDate}T00:00:00`);
+  const diffDays = Math.round((dueDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+  const labels = { 7: 'in 7 days', 2: 'in 2 days', 1: 'tomorrow', 0: 'TODAY' };
+  if (!Object.hasOwn(labels, diffDays)) return null;
+  return {
+    reminderType: `scheduled_reminder_${diffDays === 0 ? 'today' : `${diffDays}_days`}`,
+    messageText: `Scheduled order #${String(order.order_id || '').slice(0, 8)} is required ${labels[diffDays]} (${scheduledDate}).`,
+    isScheduled: true,
+  };
+};
+
 async function processUrgentDeadlineReminders({ orders = null, dbInstance = db, sendEmailFn = sendEmail, createNotificationFn = createAdminNotification, now = () => new Date() } = {}) {
   const today = new Date(now());
   today.setHours(0, 0, 0, 0);
@@ -57,7 +71,9 @@ async function processUrgentDeadlineReminders({ orders = null, dbInstance = db, 
   let processed = 0;
 
   for (const order of sourceOrders) {
-    const reminder = resolveUrgentReminder(order, today);
+    const reminder = (order?.is_scheduled || order?.productOption?.is_scheduled)
+      ? resolveScheduledReminder(order, today)
+      : resolveUrgentReminder(order, today);
     if (!reminder) continue;
 
     const existingNotification = await dbInstance.AdminNotification.findOne({
@@ -72,22 +88,28 @@ async function processUrgentDeadlineReminders({ orders = null, dbInstance = db, 
 
     const admins = await dbInstance.Admin.findAll();
     const eligibleAdmins = admins.filter((admin) => Boolean(admin.email) && (admin.notifPreferences || {}).deadlineReminders !== false);
+    const notificationAdmins = reminder.isScheduled ? admins : eligibleAdmins;
 
-    for (const admin of eligibleAdmins) {
+    for (const admin of notificationAdmins) {
       await createNotificationFn({
         adminId: admin.id,
         orderId: order.order_id,
         type: reminder.reminderType,
-        title: `Urgent Deadline Alert (${reminder.reminderType === 'reminder_due_today' ? 'Today' : 'Due soon'})`,
+        title: reminder.isScheduled
+          ? `Scheduled Order Reminder (${reminder.reminderType.endsWith('today') ? 'Today' : 'Due soon'})`
+          : `Urgent Deadline Alert (${reminder.reminderType === 'reminder_due_today' ? 'Today' : 'Due soon'})`,
         message: reminder.messageText,
       });
+    }
 
+    for (const admin of eligibleAdmins) {
+      const orderUrl = `${(process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, '')}/admin/orders/${encodeURIComponent(order.order_id)}`;
       await sendEmailFn({
         to: admin.email,
-        subject: `Urgent deadline alert for order ${order.order_id}`,
-        text: `${reminder.messageText} Review: ${process.env.FRONTEND_URL || 'http://localhost:3000'}/orders/${encodeURIComponent(order.order_id)}`,
-        html: `<p>${reminder.messageText}</p><p><a href="${(process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, '')}/orders/${encodeURIComponent(order.order_id)}">Open order</a></p>`,
-        metadata: { type: 'deadline_reminder', orderId: order.order_id, reminderType: reminder.reminderType },
+        subject: `${reminder.isScheduled ? 'Scheduled order reminder' : 'Urgent deadline alert'} for order ${order.order_id}`,
+        text: `${reminder.messageText} Review: ${orderUrl}`,
+        html: `<p>${reminder.messageText}</p><p><a href="${orderUrl}">Open order</a></p>`,
+        metadata: { type: reminder.isScheduled ? 'scheduled_order_reminder' : 'deadline_reminder', orderId: order.order_id, reminderType: reminder.reminderType },
       });
     }
 
@@ -115,6 +137,7 @@ function startUrgentReminderCron() {
 
 module.exports = {
   resolveUrgentReminder,
+  resolveScheduledReminder,
   processUrgentDeadlineReminders,
   startUrgentReminderCron,
 };

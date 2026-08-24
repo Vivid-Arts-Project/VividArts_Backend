@@ -8,10 +8,20 @@ const { createNotification, resolveNotificationCustomerId } = require('../utils/
 const { paginationFrom, paginationMeta } = require('../utils/pagination');
 const { sendRevisionRequestedAdminEmail } = require('../middleware/email');
 const { uploadReview, deleteImage } = require('../middleware/upload');
+const { ACTIVE_STATUSES, sortProductionQueue } = require('../utils/scheduling');
 
 router.get('/my-orders', protect, async (req, res) => {
   try {
     const { page, limit, offset } = paginationFrom(req.query);
+    const activeQueue = await db.Order.findAll({
+      where: {
+        status: { [db.Sequelize.Op.in]: ACTIVE_STATUSES },
+        amount_paid: { [db.Sequelize.Op.gt]: 0 },
+      },
+      attributes: ['order_id', 'status', 'is_urgent', 'is_scheduled', 'createdAt'],
+      include: [{ model: db.ProductOption, as: 'productOption' }],
+    });
+    const queuePositions = new Map(sortProductionQueue(activeQueue).map((order, index) => [order.order_id, index + 1]));
     const { count, rows: orders } = await db.Order.findAndCountAll({
       where: { customer_id: req.user.customerId },
       include: [
@@ -61,6 +71,9 @@ router.get('/my-orders', protect, async (req, res) => {
         deliveryAddress: checkoutDetails.deliveryAddress || null,
         isUrgent: Boolean(order.is_urgent || product.is_urgent),
         urgentDeadline: product.urgent_deadline,
+        isScheduled: Boolean(order.is_scheduled || product.is_scheduled),
+        scheduledDate: product.scheduled_date,
+        scheduledStartDate: product.scheduled_start_date,
         customerNote: product.customer_note,
         artistLocation: order.artist_location,
         currency: order.currency,
@@ -69,6 +82,8 @@ router.get('/my-orders', protect, async (req, res) => {
         balanceDue: Math.max(0, Number(order.calculated_price || 0) - amountPaid),
         paymentType: order.payment_type,
         paymentStatus,
+        queuePosition: queuePositions.get(order.order_id) || null,
+        queueUpdatedAt: new Date().toISOString(),
         payments: (order.payments || []).map(payment => ({
           id: payment.paymentId,
           providerOrderId: payment.payhereOrderId,

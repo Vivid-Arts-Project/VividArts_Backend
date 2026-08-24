@@ -14,6 +14,7 @@ async function calculatePrice({ paperSize, subjectCount, numSubjects, frameType,
     ...(order.framePrice ? [{ label: `${order.frameLabel} frame`, amount: order.framePrice }] : []),
     ...(pickupOption === 'pickup' ? [] : [{ label: 'Delivery charge', amount: order.deliveryPrice }]),
     ...(order.urgentPrice ? [{ label: 'Urgent order charge', amount: order.urgentPrice }] : []),
+    ...(order.scheduledPrice ? [{ label: 'Scheduled order charge', amount: order.scheduledPrice }] : []),
   ];
   return { breakdown, total: breakdown.reduce((sum, row) => sum + row.amount, 0) };
 }

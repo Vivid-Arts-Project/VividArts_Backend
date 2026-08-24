@@ -59,10 +59,11 @@ const orderJson = (instance) => {
   const completedPaid = (o.payments || []).filter(payment => payment.status === 'completed').reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
   const checkoutDetails = ((o.payments || []).find(payment => payment.metadata?.order)?.metadata?.order) || {};
   return { ...o, customer, id: o.order_id, customerId: o.customer_id, totalPrice: o.calculated_price,
-    amountPaid: completedPaid || Number(o.amount_paid || 0), paymentType: o.payment_type, isUrgent: o.is_urgent,
+    amountPaid: completedPaid || Number(o.amount_paid || 0), paymentType: o.payment_type, isUrgent: o.is_urgent, isScheduled: o.is_scheduled,
     artistLocation: o.artist_location, paperSize: p.paper_size,
     subjectCount: p.num_subjects ? `${p.num_subjects}_subjects` : null,
     frameType: p.frame_type, pickupOption: p.pickup_option, deliveryAddress: checkoutDetails.deliveryAddress || null, urgentDeadline: p.urgent_deadline,
+    scheduledDate: p.scheduled_date, scheduledStartDate: p.scheduled_start_date,
     customerNote: p.customer_note,
     referencePhotos: (o.referencePhotos || []).map(photo => photo.cloudinary_url),
     proofImagePath: o.proofImages?.find(proof => proof.is_current)?.cloudinary_url || null,
@@ -413,20 +414,48 @@ router.post('/pricing/calculate', requireAdmin, requireSuperAdmin, async (req, r
 // ORDERS
 // ════════════════════════════════════════════════════════════════════════════
 
+router.get('/calendar-events', requireAdmin, async (req, res) => {
+  try {
+    const from = /^\d{4}-\d{2}-\d{2}$/.test(req.query.from || '') ? req.query.from : null;
+    const to = /^\d{4}-\d{2}-\d{2}$/.test(req.query.to || '') ? req.query.to : null;
+    const rows = await db.Order.findAll({
+      where: { status: { [db.Sequelize.Op.ne]: 'done' }, amount_paid: { [db.Sequelize.Op.gt]: 0 } },
+      attributes: ['order_id', 'status', 'is_urgent', 'is_scheduled'],
+      include: [
+        { model: db.Customer, as: 'customer', attributes: ['full_name', 'username'] },
+        { model: db.ProductOption, as: 'productOption', attributes: ['is_urgent', 'urgent_deadline', 'is_scheduled', 'scheduled_date'] },
+      ],
+    });
+    const events = rows.flatMap(instance => {
+      const order = instance.toJSON();
+      const customerName = order.customer?.full_name || order.customer?.username || 'Customer';
+      const candidates = [
+        ((order.is_urgent || order.productOption?.is_urgent) && order.productOption?.urgent_deadline) ? { type: 'urgent', date: order.productOption.urgent_deadline } : null,
+        ((order.is_scheduled || order.productOption?.is_scheduled) && order.productOption?.scheduled_date) ? { type: 'scheduled', date: order.productOption.scheduled_date } : null,
+      ].filter(Boolean);
+      return candidates.filter(event => (!from || event.date >= from) && (!to || event.date <= to)).map(event => ({
+        ...event, orderId: order.order_id, status: order.status, customerName,
+      }));
+    });
+    res.json({ events });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 router.get('/orders', requireAdmin, async (req, res) => {
   try {
     await ensureUrgentDeadlineNotifications();
     const { page, limit, offset } = paginationFrom(req.query);
     const queueRows = await db.Order.findAll({
       where: { amount_paid: { [db.Sequelize.Op.gt]: 0 } },
-      attributes: ['order_id', 'status', 'is_urgent', 'calculated_price', 'amount_paid', 'createdAt'],
-      include: [{ model: db.ProductOption, as: 'productOption', attributes: ['urgent_deadline', 'num_subjects'] }],
+      attributes: ['order_id', 'status', 'is_urgent', 'is_scheduled', 'calculated_price', 'amount_paid', 'createdAt'],
+      include: [{ model: db.ProductOption, as: 'productOption', attributes: ['urgent_deadline', 'is_scheduled', 'scheduled_date', 'scheduled_start_date', 'num_subjects', 'frame_type', 'pickup_option'] }],
     });
     const stats = {
       total:       queueRows.filter(o => o.status !== 'done').length,
       inQueue:     queueRows.filter(o => o.status === 'in_queue').length,
       sketching:     queueRows.filter(o => o.status === 'sketching').length,
       urgentActive:   queueRows.filter(o => o.is_urgent && o.status !== 'done').length,
+      scheduledActive: queueRows.filter(o => o.is_scheduled && o.status !== 'done').length,
       waitingFeedback: queueRows.filter(o => o.status === 'waiting_for_feedback').length,
       revisionRequested: queueRows.filter(o => o.status === 'revision_requested').length,
       approved:     queueRows.filter(o => ['approved', 'finished'].includes(o.status)).length,
@@ -593,6 +622,7 @@ router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
         isUrgent: Boolean(order.is_urgent || product?.is_urgent),
         urgentDeadline: product?.urgent_deadline,
         people: product?.num_subjects,
+        frameId: product?.frame_type,
       });
     }
 

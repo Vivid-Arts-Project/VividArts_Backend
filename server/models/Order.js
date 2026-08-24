@@ -71,6 +71,10 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.BOOLEAN,
       defaultValue: false,
     },
+    is_scheduled: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
 
     // ── Pickup location (filled by admin when order is ready for pickup) ──────
     artist_location: {

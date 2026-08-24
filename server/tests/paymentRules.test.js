@@ -5,7 +5,7 @@ const { resolveNotificationCustomerId } = require('../utils/notificationHelper')
 const { createRealtimeNotificationHub, emitRealtimeNotification } = require('../utils/notificationRealtime');
 const { enqueueEmailDelivery, processEmailQueue, getEligibleAdminRecipients, sendRevisionRequestedAdminEmail } = require('../middleware/email');
 const { requestOTP, verifyOTP } = require('../utils/otpHelper');
-const { processUrgentDeadlineReminders } = require('../utils/urgentReminderCron');
+const { processUrgentDeadlineReminders, resolveScheduledReminder } = require('../utils/urgentReminderCron');
 const { requireAdmin } = require('../routes/adminAuth');
 
 const deposit = (status = 'completed', amount = 2000) => ({ paymentType: 'advance', status, amount });
@@ -225,6 +225,13 @@ test('processUrgentDeadlineReminders deduplicates reminders, skips cancelled/com
   assert.equal(notifications.length, 1);
   assert.equal(emails.length, 1);
   assert.equal(emails[0].to, 'a1@example.com');
+});
+
+test('scheduled orders create reminders seven days before the required date', () => {
+  const today = new Date('2026-01-01T00:00:00');
+  const reminder = resolveScheduledReminder({ order_id: 'scheduled-123', productOption: { scheduled_date: '2026-01-08' } }, today);
+  assert.equal(reminder.reminderType, 'scheduled_reminder_7_days');
+  assert.match(reminder.messageText, /in 7 days/i);
 });
 
 test('OTP expiry is rejected after the validity window', async () => {
