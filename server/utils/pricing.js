@@ -68,13 +68,13 @@ async function calculateOrder(order = {}) {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const earliest = new Date(today);
-    earliest.setDate(earliest.getDate() + 1);
+    earliest.setDate(earliest.getDate() + 3);
     const latest = new Date(today);
     latest.setDate(latest.getDate() + 7);
     const requested = urgentDeadline ? new Date(`${urgentDeadline}T00:00:00`) : null;
 
     if (!requested || Number.isNaN(requested.getTime()) || requested < earliest || requested > latest) {
-      const error = new Error('Urgent orders must have a completion date within the next 7 days.');
+      const error = new Error('Urgent orders require a minimum of 3 days and must be within the next 7 days.');
       error.statusCode = 400;
       throw error;
     }
