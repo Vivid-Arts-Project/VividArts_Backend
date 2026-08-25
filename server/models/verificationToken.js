@@ -29,9 +29,23 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.DATE, // Track time for resend cooldown
       allowNull: true,
     },
+    requestWindowStartedAt: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+    requestCount: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 0,
+    },
+    context: {
+      type: DataTypes.JSON,
+      allowNull: true,
+    },
   }, {
     tableName: 'verification_tokens',
     timestamps: true,
+    indexes: [{ unique: true, fields: ['identifier', 'type'], name: 'verification_tokens_identifier_type_unique' }],
   });
 
   return VerificationToken;

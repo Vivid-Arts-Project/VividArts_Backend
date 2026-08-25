@@ -76,6 +76,7 @@ module.exports = (sequelize, DataTypes) => {
   }, {
     tableName: 'ProofImages',
     timestamps: true,   // createdAt = when artist uploaded this version
+    indexes: [{ unique: true, fields: ['order_id', 'version'], name: 'proof_images_order_version_unique' }],
   });
 
   // ── Associations ─────────────────────────────────────────────────────────────

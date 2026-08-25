@@ -1,6 +1,11 @@
 const db = require('../models');
 const { emitRealtimeNotification } = require('./notificationRealtime');
 
+const runAfterCommit = (transaction, callback) => {
+  if (transaction?.afterCommit) transaction.afterCommit(callback);
+  else callback();
+};
+
 const resolveNotificationCustomerId = ({ requestCustomerId, orderCustomerId, trustedBackend = false } = {}) => {
   const normalizedRequestCustomerId = requestCustomerId == null ? null : String(requestCustomerId);
   const normalizedOrderCustomerId = orderCustomerId == null ? null : String(orderCustomerId);
@@ -19,12 +24,12 @@ const resolveNotificationCustomerId = ({ requestCustomerId, orderCustomerId, tru
 // A helper function that saves the notification to the database after the administrator status is changed.
 const createNotification = async (customerId, orderId, title, message, status, options = {}) => {
   try {
-    const { trustedBackend = false, orderCustomerId = customerId } = options;
+    const { trustedBackend = false, orderCustomerId = customerId, transaction } = options;
     const safeCustomerId = resolveNotificationCustomerId({
       requestCustomerId: customerId,
       orderCustomerId,
       trustedBackend,
-    });
+    }, { transaction });
 
     const notification = await db.Notification.create({
       customerId: safeCustomerId,
@@ -36,16 +41,19 @@ const createNotification = async (customerId, orderId, title, message, status, o
 
     const unreadCount = await db.Notification.count({
       where: { customerId: safeCustomerId, isRead: false },
+      transaction,
     });
 
-    emitRealtimeNotification({
-      type: 'customer',
-      userId: safeCustomerId,
-      event: {
-        type: 'notification',
-        notification: notification.toJSON ? notification.toJSON() : notification,
-        unreadCount,
-      },
+    runAfterCommit(transaction, () => {
+      emitRealtimeNotification({
+        type: 'customer',
+        userId: safeCustomerId,
+        event: {
+          type: 'notification',
+          notification: notification.toJSON ? notification.toJSON() : notification,
+          unreadCount,
+        },
+      });
     });
 
     return notification;
@@ -55,4 +63,4 @@ const createNotification = async (customerId, orderId, title, message, status, o
   }
 };
 
-module.exports = { createNotification, resolveNotificationCustomerId };
+module.exports = { createNotification, resolveNotificationCustomerId, runAfterCommit };

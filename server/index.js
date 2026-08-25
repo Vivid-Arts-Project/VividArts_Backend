@@ -5,7 +5,7 @@ const express = require('express');
 const session = require('express-session');
 const cors    = require('cors');
 const app     = express();  
-const port    = Number(process.env.PORT) || 5000;
+const port    = Number(process.env.PORT) || 3001;
 const isProduction = process.env.NODE_ENV === 'production';
 const db = require('./models');
 const { startEmailQueueWorker } = require('./middleware/email');
@@ -79,19 +79,13 @@ app.use(session({
 }));
 
 // SameSite cookies are the primary CSRF boundary; origin verification adds a
-// second check for every cookie-authenticated state-changing request.
+// second check for every customer- or admin-authenticated state change,
+// regardless of which API route group owns the endpoint.
 app.use((req, res, next) => {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
   const hasCustomerCookie = (req.headers.cookie || '').includes('vividarts.customer.token=');
-  if (!hasCustomerCookie) return next();
-  const origin = req.get('origin');
-  if (origin && allowedOrigins.includes(origin.replace(/\/$/, ''))) return next();
-  return res.status(403).json({ error: 'Invalid request origin' });
-});
-
-// Reject cross-site state changes that carry an authenticated admin cookie.
-app.use('/api/admin', (req, res, next) => {
-  if (!req.session?.adminId || ['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+  const hasAdminSession = Boolean(req.session?.adminId);
+  if (!hasCustomerCookie && !hasAdminSession) return next();
   const origin = req.get('origin');
   if (origin && allowedOrigins.includes(origin.replace(/\/$/, ''))) return next();
   return res.status(403).json({ error: 'Invalid request origin' });
@@ -106,7 +100,6 @@ const adminAuthRouter = require('./routes/adminAuth');  // login, register, /me
 const adminRouter     = require('./routes/admin');       // orders, proofs, pricing
 const ordersRouter = require('./routes/orders');
 const contentRouter = require('./routes/content');
-const customerNotificationsRouter = require('./routes/customerNotifications');
 
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
 app.use('/api', async (req, res, next) => {
@@ -132,7 +125,6 @@ app.use('/api/admin',     adminAuthRouter); // POST /api/admin/login etc.
 app.use('/api/admin',     adminRouter);     // GET  /api/admin/orders etc.
 app.use('/api/orders', ordersRouter);
 app.use('/api/content', contentRouter);
-app.use('/api/customers/notifications', customerNotificationsRouter);
 
 // ── 6. Sync DB and start ──────────────────────────────────────────────────────
 // Create any missing tables once on startup without resetting existing data.

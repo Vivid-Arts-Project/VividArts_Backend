@@ -1,8 +1,11 @@
 const nodemailer = require('nodemailer');
+const crypto = require('crypto');
 const db = require('../models');
 
 const requiredSmtpVariables = ['SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS'];
 const DEFAULT_EMAIL_RETRY_LIMIT = 3;
+const EMAIL_CLAIM_LIMIT = 50;
+const EMAIL_CLAIM_TIMEOUT_MS = 10 * 60 * 1000;
 let emailDeliveryTablePromise = null;
 
 async function ensureEmailDeliveryTable() {
@@ -66,14 +69,17 @@ function getOrderUrl(orderId, view = null) {
   return `${baseUrl}?view=${encodeURIComponent(view)}`;
 }
 
-async function enqueueEmailDelivery({ to, subject, text, html, metadata = {}, maxAttempts = DEFAULT_EMAIL_RETRY_LIMIT }) {
+async function enqueueEmailDelivery(
+  { to, subject, text, html, metadata = {}, maxAttempts = DEFAULT_EMAIL_RETRY_LIMIT },
+  { emailDeliveryModel = db?.EmailDelivery, ensureTable = ensureEmailDeliveryTable } = {},
+) {
   if (!to) {
     throw new Error('Cannot queue email without a recipient address');
   }
 
-  await ensureEmailDeliveryTable();
+  await ensureTable();
 
-  const EmailDelivery = db?.EmailDelivery;
+  const EmailDelivery = emailDeliveryModel;
   if (!EmailDelivery) {
     return {
       id: Date.now(),
@@ -106,18 +112,71 @@ async function enqueueEmailDelivery({ to, subject, text, html, metadata = {}, ma
   return { ...payload, queued: true };
 }
 
+async function claimEmailDeliveries({ emailDeliveryModel, now = new Date(), limit = EMAIL_CLAIM_LIMIT }) {
+  const EmailDelivery = emailDeliveryModel;
+  const Op = db.Sequelize.Op;
+  const staleBefore = new Date(now.getTime() - EMAIL_CLAIM_TIMEOUT_MS);
+  await EmailDelivery.update({
+    status: 'retrying',
+    lockedAt: null,
+    lockToken: null,
+    nextAttemptAt: now,
+    lastError: 'Previous email worker stopped before delivery was recorded',
+  }, {
+    where: {
+      status: 'processing',
+      lockedAt: { [Op.lt]: staleBefore },
+    },
+  });
+
+  const candidates = await EmailDelivery.findAll({
+    attributes: ['id'],
+    where: {
+      status: { [Op.in]: ['queued', 'retrying'] },
+      [Op.or]: [
+        { nextAttemptAt: null },
+        { nextAttemptAt: { [Op.lte]: now } },
+      ],
+    },
+    order: [['createdAt', 'ASC']],
+    limit,
+  });
+
+  const claimed = [];
+  for (const candidate of candidates) {
+    const lockToken = crypto.randomUUID();
+    const [updated] = await EmailDelivery.update({
+      status: 'processing',
+      lockedAt: now,
+      lockToken,
+    }, {
+      where: {
+        id: candidate.id,
+        status: { [Op.in]: ['queued', 'retrying'] },
+        [Op.or]: [
+          { nextAttemptAt: null },
+          { nextAttemptAt: { [Op.lte]: now } },
+        ],
+      },
+    });
+    if (updated !== 1) continue;
+    const record = await EmailDelivery.findOne({ where: { id: candidate.id, lockToken } });
+    if (record) claimed.push(record);
+  }
+  return claimed;
+}
+
 async function processEmailQueue({ queue = null, transport = null, now = () => new Date() } = {}) {
-  await ensureEmailDeliveryTable();
+  if (!queue) await ensureEmailDeliveryTable();
 
   const EmailDelivery = db?.EmailDelivery;
   let items = queue;
 
   if (!items) {
     if (!EmailDelivery) return [];
-    items = await EmailDelivery.findAll({
-      where: {
-        status: ['queued', 'retrying'],
-      },
+    items = await claimEmailDeliveries({
+      emailDeliveryModel: EmailDelivery,
+      now: now(),
     });
   }
 
@@ -150,7 +209,10 @@ async function processEmailQueue({ queue = null, transport = null, now = () => n
         html: record.html,
       });
 
-      const updated = { status: 'sent', attempts: nextAttempt, sentAt: now(), lastError: null, nextAttemptAt: null };
+      const updated = {
+        status: 'sent', attempts: nextAttempt, sentAt: now(), lastError: null, nextAttemptAt: null,
+        lockedAt: null, lockToken: null,
+      };
       if (item && typeof item.update === 'function') {
         await item.update(updated);
         processed.push({ ...record, ...updated });
@@ -172,7 +234,9 @@ async function processEmailQueue({ queue = null, transport = null, now = () => n
         status: shouldRetry ? 'retrying' : 'failed',
         attempts: nextAttempt,
         lastError: error.message,
-        nextAttemptAt: shouldRetry ? new Date(Date.now() + Math.min(1000 * (2 ** nextAttempt), 300000)) : null,
+        nextAttemptAt: shouldRetry ? new Date(now().getTime() + Math.min(1000 * (2 ** nextAttempt), 300000)) : null,
+        lockedAt: null,
+        lockToken: null,
       };
 
       if (item && typeof item.update === 'function') {
@@ -196,15 +260,20 @@ async function processEmailQueue({ queue = null, transport = null, now = () => n
 }
 
 let emailQueueTimer = null;
+let emailQueueFlushPromise = null;
 
 function startEmailQueueWorker(intervalMs = 30000) {
   if (emailQueueTimer) return emailQueueTimer;
 
   const flush = async () => {
+    if (emailQueueFlushPromise) return emailQueueFlushPromise;
+    emailQueueFlushPromise = processEmailQueue();
     try {
-      await processEmailQueue();
+      await emailQueueFlushPromise;
     } catch (error) {
       console.error('[email] Queue worker failed:', error.message);
+    } finally {
+      emailQueueFlushPromise = null;
     }
   };
 
@@ -278,6 +347,9 @@ async function sendRevisionRequestedAdminEmail({
   admins = [],
   sendEmailFn = sendEmail,
   createInAppNotification = null,
+  findExistingNotification = ({ adminId, orderId }) => db.AdminNotification.findOne({
+    where: { admin_id: adminId, order_id: orderId, type: 'revision' },
+  }),
 }) {
   const orderId = order?.order_id || order?.id || order;
   const safeCustomerName = String(customerName || 'Customer').trim() || 'Customer';
@@ -303,13 +375,7 @@ async function sendRevisionRequestedAdminEmail({
     `;
 
     if (createInAppNotification && typeof createInAppNotification === 'function') {
-      const existing = await db.AdminNotification.findOne({
-        where: {
-          admin_id: admin.id,
-          order_id: orderId,
-          type: 'revision',
-        },
-      });
+      const existing = await findExistingNotification({ adminId: admin.id, orderId });
       if (!existing) {
         await createInAppNotification({
           adminId: admin.id,
@@ -411,6 +477,7 @@ module.exports = {
   sendEmail,
   sendEmailNow,
   enqueueEmailDelivery,
+  claimEmailDeliveries,
   processEmailQueue,
   startEmailQueueWorker,
   sendProofReadyEmail,

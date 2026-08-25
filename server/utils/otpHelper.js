@@ -6,17 +6,8 @@ const RESEND_COOLDOWN_MS = 60 * 1000;
 const MAX_ATTEMPTS = 5;
 const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 const MAX_REQUESTS_PER_WINDOW = 3;
-const requestTracker = new Map();
 
 const hashOtp = (identifier, code) => crypto.createHash('sha256').update(`${identifier}:${code}`).digest('hex');
-
-const getRecentRequestTimes = (identifier) => {
-  const now = Date.now();
-  const recent = requestTracker.get(identifier) || [];
-  const filtered = recent.filter(timestamp => now - timestamp < RATE_LIMIT_WINDOW_MS);
-  requestTracker.set(identifier, filtered);
-  return filtered;
-};
 
 // Generate and save OTP with resend cooldown protection
 const requestOTP = async (email, sendEmailFunction, type = 'register') => {
@@ -26,60 +17,64 @@ const requestOTP = async (email, sendEmailFunction, type = 'register') => {
   }
 
   const now = Date.now();
-  const recentRequests = getRecentRequestTimes(identifier);
-  if (recentRequests.length >= MAX_REQUESTS_PER_WINDOW) {
-    throw new Error('Too many verification requests. Please wait before requesting a new code.');
-  }
-
-  let record = await db.VerificationToken.findOne({
-    where: { identifier, type },
-  });
-
-  if (record) {
-    const lastResentAt = record.lastResentAt ? new Date(record.lastResentAt).getTime() : 0;
+  const otp = String(crypto.randomInt(100000, 1000000));
+  const otpHash = hashOtp(identifier, otp);
+  const expiresAt = new Date(now + OTP_TTL_MS);
+  const record = await db.sequelize.transaction(async transaction => {
+    await db.VerificationToken.findOrCreate({
+      where: { identifier, type },
+      defaults: {
+        otp: otpHash,
+        attempts: 0,
+        expiresAt,
+        lastResentAt: null,
+        requestWindowStartedAt: new Date(now),
+        requestCount: 0,
+      },
+      transaction,
+    });
+    const lockedRecord = await db.VerificationToken.findOne({
+      where: { identifier, type },
+      transaction,
+      lock: transaction.LOCK.UPDATE,
+    });
+    const lastResentAt = lockedRecord.lastResentAt ? new Date(lockedRecord.lastResentAt).getTime() : 0;
     const diffMs = now - lastResentAt;
     if (diffMs < RESEND_COOLDOWN_MS) {
       const waitTime = Math.ceil((RESEND_COOLDOWN_MS - diffMs) / 1000);
       throw new Error(`Please wait ${waitTime} seconds before requesting a new code.`);
     }
-  }
-
-  const otp = String(Math.floor(100000 + Math.random() * 900000)).padStart(6, '0');
-  const otpHash = hashOtp(identifier, otp);
-  const expiresAt = new Date(now + OTP_TTL_MS);
-
-  if (record) {
-    await record.update({
+    const windowStartedAt = lockedRecord.requestWindowStartedAt
+      ? new Date(lockedRecord.requestWindowStartedAt).getTime()
+      : now;
+    const windowActive = now - windowStartedAt < RATE_LIMIT_WINDOW_MS;
+    const requestCount = windowActive ? Number(lockedRecord.requestCount || 0) : 0;
+    if (requestCount >= MAX_REQUESTS_PER_WINDOW) {
+      throw new Error('Too many verification requests. Please wait before requesting a new code.');
+    }
+    await lockedRecord.update({
       otp: otpHash,
       attempts: 0,
       expiresAt,
       lastResentAt: new Date(now),
-    });
-  } else {
-    await db.VerificationToken.create({
-      identifier,
-      otp: otpHash,
-      type,
-      attempts: 0,
-      expiresAt,
-      lastResentAt: new Date(now),
-    });
-  }
+      requestWindowStartedAt: new Date(windowActive ? windowStartedAt : now),
+      requestCount: requestCount + 1,
+    }, { transaction });
+    return lockedRecord;
+  });
 
   let delivery;
   try {
     delivery = await sendEmailFunction(identifier, otp);
   } catch (error) {
-    await db.VerificationToken.destroy({ where: { identifier, type } });
+    await record.update({ otp: hashOtp(identifier, crypto.randomBytes(32).toString('hex')), expiresAt: new Date(0) });
     throw error;
   }
   if (delivery?.skipped) {
-    await db.VerificationToken.destroy({ where: { identifier, type } });
+    await record.update({ otp: hashOtp(identifier, crypto.randomBytes(32).toString('hex')), expiresAt: new Date(0) });
     throw new Error('Email verification is not configured. Please contact the administrator.');
   }
-  recentRequests.push(now);
-  requestTracker.set(identifier, recentRequests.slice(-MAX_REQUESTS_PER_WINDOW));
-  return { message: 'OTP sent successfully', code: otp };
+  return { message: 'OTP sent successfully' };
 };
 
 // Verify the submitted OTP with attempt limiting and expiry checks

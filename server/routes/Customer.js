@@ -1,23 +1,34 @@
 const express = require('express');
 const router = express.Router();
 const { paginationFrom, paginationMeta } = require('../utils/pagination');
-const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
-const { Customer, Notification } = require('../models');
+const db = require('../models');
+const { Customer, Notification, VerificationToken } = db;
 const { Op } = require('sequelize');
 const { sendEmailNow } = require('../middleware/email');
 const { protect } = require('../middleware/authMiddleware');
-const { requestOTP, verifyOTP } = require('../utils/otpHelper');
+const customerLoginLimiter = require('../middleware/customerLoginLimiter');
+const verificationRequestLimiter = require('../middleware/verificationRequestLimiter');
+const { requestOTP, verifyOTP, hashOtp } = require('../utils/otpHelper');
+const {
+  customerPasswordNeedsRehash,
+  hashCustomerPassword,
+  verifyCustomerPassword,
+} = require('../utils/passwordHash');
 
 const { uploadProfile, uploadProfileImage, uploadCover, deleteImage } = require('../middleware/upload');
 const { JWT_SECRET } = require('../config/auth');
+const { normalizeCustomerProfileUpdate } = require('../utils/customerProfileRules');
 
 const OTP_LIFETIME_MS = 10 * 60 * 1000;
-const verifiedEmailTokens = new Map();
 
 const createToken = (customer) => jwt.sign(
-  { customerId: customer.customer_id, email: customer.email },
+  {
+    customerId: customer.customer_id,
+    email: customer.email,
+    tokenVersion: Number(customer.token_version || 0),
+  },
   JWT_SECRET,
   { expiresIn: '8h' }
 );
@@ -30,7 +41,7 @@ const customerCookieOptions = {
 };
 
 // 📧 1. SEND OTP TO EMAIL ROUTE
-router.post('/register/send-otp', async (req, res) => {
+router.post('/register/send-otp', verificationRequestLimiter, async (req, res) => {
   try {
     const username = String(req.body.username || '').trim();
     const email = String(req.body.email || '').trim().toLowerCase();
@@ -76,13 +87,22 @@ router.post('/register/verify-otp', async (req, res) => {
     const email = String(req.body.email || '').trim().toLowerCase();
     const code = String(req.body.code || '').trim();
     const username = String(req.body.username || '').trim();
+    if (!email || !code || !username) {
+      return res.status(400).json({ message: 'Email, username and verification code are required.' });
+    }
 
     const result = await verifyOTP(email, code);
     const verificationToken = crypto.randomBytes(32).toString('hex');
-    verifiedEmailTokens.set(verificationToken, {
-      username,
-      email,
-      expiresAt: Date.now() + OTP_LIFETIME_MS,
+    await VerificationToken.upsert({
+      identifier: email,
+      type: 'registration_verified',
+      otp: hashOtp(email, verificationToken),
+      attempts: 0,
+      expiresAt: new Date(Date.now() + OTP_LIFETIME_MS),
+      lastResentAt: null,
+      requestWindowStartedAt: null,
+      requestCount: 0,
+      context: { username },
     });
 
     res.json({ message: result.message, verificationToken });
@@ -124,28 +144,31 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ message: 'Password must be at least 8 characters long.' });
     }
 
-    const verifiedEmail = verifiedEmailTokens.get(verificationToken);
-    if (
-      !verifiedEmail ||
-      verifiedEmail.expiresAt < Date.now() ||
-      verifiedEmail.email !== normalizedEmail ||
-      (verifiedEmail.username && verifiedEmail.username !== normalizedUsername)
-    ) {
-      return res.status(403).json({ message: 'Please verify your email address before creating an account.' });
-    }
-
-    const HASH_ROUNDS = parseInt(process.env.BCRYPT_ROUNDS, 10) || 4;
-    const hashedPassword = await bcrypt.hash(password, HASH_ROUNDS);
-
-    const newCustomer = await Customer.create({
-      username: normalizedUsername,
-      email: normalizedEmail,
-      password_hash: hashedPassword,
-      full_name: normalizedFullName,
-      address: 'N/A',
-      phone_number: normalizedPhoneNumber,
+    const hashedPassword = await hashCustomerPassword(password);
+    const newCustomer = await db.sequelize.transaction(async transaction => {
+      const verifiedEmail = await VerificationToken.findOne({
+        where: { identifier: normalizedEmail, type: 'registration_verified' },
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+      });
+      const isVerified = verifiedEmail
+        && new Date(verifiedEmail.expiresAt).getTime() >= Date.now()
+        && verifiedEmail.otp === hashOtp(normalizedEmail, verificationToken)
+        && verifiedEmail.context?.username === normalizedUsername;
+      if (!isVerified) {
+        throw Object.assign(new Error('Please verify your email address before creating an account.'), { statusCode: 403 });
+      }
+      const customer = await Customer.create({
+        username: normalizedUsername,
+        email: normalizedEmail,
+        password_hash: hashedPassword,
+        full_name: normalizedFullName,
+        address: 'N/A',
+        phone_number: normalizedPhoneNumber,
+      }, { transaction });
+      await verifiedEmail.destroy({ transaction });
+      return customer;
     });
-    verifiedEmailTokens.delete(verificationToken);
 
     res.status(201).json({
       message: 'Registration successful.',
@@ -153,6 +176,7 @@ router.post('/register', async (req, res) => {
       customer: { username: newCustomer.username, email: newCustomer.email },
     });
   } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
     if (error.name === 'SequelizeUniqueConstraintError') {
       return res.status(409).json({ message: 'An account with this username or email already exists.' });
     }
@@ -164,7 +188,7 @@ router.post('/register', async (req, res) => {
 });
 
 // 🔓 4. LOGIN ROUTE
-router.post('/login', async (req, res) => {
+router.post('/login', customerLoginLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
 
@@ -177,12 +201,23 @@ router.post('/login', async (req, res) => {
       where: { [Op.or]: [{ username: identifier }, { email: identifier.toLowerCase() }] },
     });
     if (!customer) {
+      req.customerLoginAttempt.failed();
       return res.status(401).json({ message: 'Invalid username/email or password.' });
     }
 
-    const passwordMatch = await bcrypt.compare(password, customer.password_hash);
+    const passwordMatch = await verifyCustomerPassword(password, customer.password_hash);
     if (!passwordMatch) {
-      return res.status(401).json({ message: 'Invalid username or password.' });
+      req.customerLoginAttempt.failed();
+      return res.status(401).json({ message: 'Invalid username/email or password.' });
+    }
+
+    req.customerLoginAttempt.succeeded();
+    if (customerPasswordNeedsRehash(customer.password_hash)) {
+      try {
+        await customer.update({ password_hash: await hashCustomerPassword(password) });
+      } catch (rehashError) {
+        console.error('[security] Unable to upgrade customer password hash:', rehashError.message);
+      }
     }
 
     const token = createToken(customer);
@@ -211,7 +246,7 @@ router.post('/logout', (_req, res) => {
   res.json({ message: 'Logged out.' });
 });
 
-router.post('/forgot-password/send-otp', async (req, res) => {
+router.post('/forgot-password/send-otp', verificationRequestLimiter, async (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
   if (!email) return res.status(400).json({ message: 'Email is required.' });
   try {
@@ -246,8 +281,10 @@ router.post('/forgot-password/reset', async (req, res) => {
     const customer = await Customer.findOne({ where: { email } });
     if (!customer) return res.status(400).json({ message: 'Invalid or expired verification request.' });
     await verifyOTP(email, code, 'password_reset');
-    const rounds = parseInt(process.env.BCRYPT_ROUNDS, 10) || 4;
-    await customer.update({ password_hash: await bcrypt.hash(newPassword, rounds) });
+    await customer.update({
+      password_hash: await hashCustomerPassword(newPassword),
+      token_version: Number(customer.token_version || 0) + 1,
+    });
     res.clearCookie('vividarts.customer.token', { httpOnly: true, secure: customerCookieOptions.secure, sameSite: customerCookieOptions.sameSite, path: '/' });
     res.json({ message: 'Password reset successfully. You can now sign in.' });
   } catch (error) {
@@ -286,20 +323,25 @@ router.post('/profile/avatar', protect, async (req, res) => {
     uploadProfile(req, res, async (err) => {
       if (err) return res.status(400).json({ message: err.message || 'Upload failed.' });
       if (!req.file) return res.status(400).json({ message: 'No file uploaded.' });
+      let uploadedImage = null;
+      try {
+        const customer = await Customer.findByPk(req.user.customerId);
+        if (!customer) return res.status(404).json({ message: 'Customer not found.' });
 
-      const customer = await Customer.findByPk(req.user.customerId);
-      if (!customer) return res.status(404).json({ message: 'Customer not found.' });
+        const previousPublicId = customer.profile_image_public_id;
+        uploadedImage = await uploadProfileImage(req.file, customer.customer_id);
 
-      const previousPublicId = customer.profile_image_public_id;
-      const uploadedImage = await uploadProfileImage(req.file, customer.customer_id);
+        customer.profile_image_url = uploadedImage.url;
+        customer.profile_image_public_id = uploadedImage.publicId;
+        await customer.save();
 
-      customer.profile_image_url = uploadedImage.url;
-      customer.profile_image_public_id = uploadedImage.publicId;
-      await customer.save();
+        try { if (previousPublicId && previousPublicId !== uploadedImage.publicId) await deleteImage(previousPublicId); } catch (e) { /* ignore */ }
 
-      try { if (previousPublicId && previousPublicId !== uploadedImage.publicId) await deleteImage(previousPublicId); } catch (e) { /* ignore */ }
-
-      res.json({ message: 'Profile image updated.', profile_image_url: customer.profile_image_url });
+        return res.json({ message: 'Profile image updated.', profile_image_url: customer.profile_image_url });
+      } catch (uploadError) {
+        if (uploadedImage?.publicId) await deleteImage(uploadedImage.publicId).catch(() => {});
+        return res.status(uploadError.statusCode || 502).json({ message: uploadError.statusCode ? uploadError.message : 'Unable to store profile image.' });
+      }
     });
   } catch (error) {
     res.status(500).json({ message: error.message || 'Unable to upload profile image.' });
@@ -314,18 +356,24 @@ router.post('/profile/cover', protect, async (req, res) => {
       if (err) return res.status(400).json({ message: err.message || 'Upload failed.' });
       if (!req.file) return res.status(400).json({ message: 'No file uploaded.' });
 
-      const customer = await Customer.findByPk(req.user.customerId);
-      if (!customer) return res.status(404).json({ message: 'Customer not found.' });
+      try {
+        const customer = await Customer.findByPk(req.user.customerId);
+        if (!customer) {
+          await deleteImage(req.file.filename).catch(() => {});
+          return res.status(404).json({ message: 'Customer not found.' });
+        }
 
-      const previousPublicId = customer.cover_image_public_id;
+        const previousPublicId = customer.cover_image_public_id;
+        customer.cover_image_url = req.file.path;
+        customer.cover_image_public_id = req.file.filename;
+        await customer.save();
 
-      customer.cover_image_url = req.file.path;
-      customer.cover_image_public_id = req.file.filename;
-      await customer.save();
-
-      try { if (previousPublicId && previousPublicId !== req.file.filename) await deleteImage(previousPublicId); } catch (e) { /* ignore */ }
-
-      res.json({ message: 'Cover image updated.', cover_image_url: customer.cover_image_url });
+        try { if (previousPublicId && previousPublicId !== req.file.filename) await deleteImage(previousPublicId); } catch (e) { /* ignore */ }
+        res.json({ message: 'Cover image updated.', cover_image_url: customer.cover_image_url });
+      } catch (uploadError) {
+        await deleteImage(req.file.filename).catch(() => {});
+        res.status(500).json({ message: 'Unable to update cover image.' });
+      }
     });
   } catch (error) {
     res.status(500).json({ message: error.message || 'Unable to upload cover image.' });
@@ -339,13 +387,7 @@ router.put('/profile', protect, async (req, res) => {
       return res.status(404).json({ message: 'Customer not found.' });
     }
 
-    const { fullName, username, phoneNumber, email } = req.body;
-    if (fullName !== undefined) customer.full_name = String(fullName).trim();
-    if (username) customer.username = username;
-    if (phoneNumber !== undefined) customer.phone_number = String(phoneNumber).trim();
-    if (email) customer.email = email;
-
-    await customer.save();
+    await customer.update(normalizeCustomerProfileUpdate(req.body, customer));
 
     res.json({
       message: 'Profile updated successfully.',
@@ -359,7 +401,9 @@ router.put('/profile', protect, async (req, res) => {
       },
     });
   } catch (error) {
-    res.status(500).json({ message: error.message || 'Unable to update profile.' });
+    if (error.statusCode) return res.status(error.statusCode).json({ message: error.message, code: error.code });
+    if (error.name === 'SequelizeValidationError') return res.status(400).json({ message: error.errors[0]?.message || 'Invalid profile details.' });
+    res.status(500).json({ message: 'Unable to update profile.' });
   }
 });
 
@@ -371,10 +415,13 @@ router.patch('/password', protect, async (req, res) => {
     if (!currentPassword || !newPassword || !confirmPassword) return res.status(400).json({ message: 'All password fields are required.' });
     if (newPassword !== confirmPassword) return res.status(400).json({ message: 'New passwords do not match.' });
     if (newPassword.length < 8) return res.status(400).json({ message: 'New password must be at least 8 characters long.' });
-    if (!(await bcrypt.compare(currentPassword, customer.password_hash))) return res.status(400).json({ message: 'Current password is incorrect.' });
-    const rounds = parseInt(process.env.BCRYPT_ROUNDS, 10) || 4;
-    await customer.update({ password_hash: await bcrypt.hash(newPassword, rounds) });
-    res.json({ message: 'Password updated successfully.' });
+    if (!(await verifyCustomerPassword(currentPassword, customer.password_hash))) return res.status(400).json({ message: 'Current password is incorrect.' });
+    await customer.update({
+      password_hash: await hashCustomerPassword(newPassword),
+      token_version: Number(customer.token_version || 0) + 1,
+    });
+    res.clearCookie('vividarts.customer.token', { httpOnly: true, secure: customerCookieOptions.secure, sameSite: customerCookieOptions.sameSite, path: '/' });
+    res.json({ message: 'Password updated successfully. Please sign in again.' });
   } catch (error) {
     res.status(500).json({ message: 'Unable to update password. Please try again.' });
   }

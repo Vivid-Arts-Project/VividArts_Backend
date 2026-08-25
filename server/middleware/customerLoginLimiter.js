@@ -4,13 +4,12 @@ const MAX_ACCOUNT_FAILURES = 10;
 const MAX_IP_FAILURES = 30;
 const MAX_TRACKED_KEYS = 10_000;
 
-function createAdminLoginLimiter({
+function createCustomerLoginLimiter({
   now = () => Date.now(),
   windowMs = WINDOW_MS,
   lockMs = LOCK_MS,
   maxAccountFailures = MAX_ACCOUNT_FAILURES,
   maxIpFailures = MAX_IP_FAILURES,
-  maxTrackedKeys = MAX_TRACKED_KEYS,
 } = {}) {
   const accountAttempts = new Map();
   const ipAttempts = new Map();
@@ -25,13 +24,14 @@ function createAdminLoginLimiter({
   };
 
   const limitMapSize = (map, timestamp) => {
+    if (map.size < MAX_TRACKED_KEYS) return;
     for (const [key, entry] of map) {
       if (entry.lockedUntil <= timestamp && timestamp - entry.lastSeenAt >= windowMs) map.delete(key);
     }
-    while (map.size >= maxTrackedKeys) map.delete(map.keys().next().value);
+    while (map.size >= MAX_TRACKED_KEYS) map.delete(map.keys().next().value);
   };
 
-  const limiter = function adminLoginLimiter(req, res, next) {
+  return function customerLoginLimiter(req, res, next) {
     const timestamp = now();
     const identifier = String(req.body?.username || '').trim().toLowerCase().slice(0, 254);
     const ip = String(req.ip || req.socket?.remoteAddress || 'unknown').slice(0, 128);
@@ -41,12 +41,13 @@ function createAdminLoginLimiter({
     const accountEntry = pruneEntry(accountAttempts, identifier, timestamp);
     const ipEntry = pruneEntry(ipAttempts, ip, timestamp);
     const lockedUntil = Math.max(accountEntry?.lockedUntil || 0, ipEntry?.lockedUntil || 0);
+
     if (lockedUntil > timestamp) {
       res.set('Retry-After', String(Math.ceil((lockedUntil - timestamp) / 1000)));
-      return res.status(429).json({ error: 'Too many login attempts. Please try again later.' });
+      return res.status(429).json({ message: 'Too many login attempts. Please try again later.' });
     }
 
-    req.adminLoginAttempt = {
+    req.customerLoginAttempt = {
       failed() {
         const failedAt = now();
         if (accountEntry) {
@@ -64,21 +65,13 @@ function createAdminLoginLimiter({
         if (identifier) accountAttempts.delete(identifier);
       },
     };
+
     next();
   };
-
-  limiter.trackedKeyCounts = () => ({ accounts: accountAttempts.size, ips: ipAttempts.size });
-  return limiter;
 }
 
-const adminLoginLimiter = createAdminLoginLimiter();
+const customerLoginLimiter = createCustomerLoginLimiter();
 
-module.exports = adminLoginLimiter;
-module.exports.createAdminLoginLimiter = createAdminLoginLimiter;
-module.exports.constants = {
-  WINDOW_MS,
-  LOCK_MS,
-  MAX_ACCOUNT_FAILURES,
-  MAX_IP_FAILURES,
-  MAX_TRACKED_KEYS,
-};
+module.exports = customerLoginLimiter;
+module.exports.createCustomerLoginLimiter = createCustomerLoginLimiter;
+module.exports.constants = { WINDOW_MS, LOCK_MS, MAX_ACCOUNT_FAILURES, MAX_IP_FAILURES };
