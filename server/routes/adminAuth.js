@@ -4,49 +4,86 @@ const db      = require('../models');
 const { createAdminNotification } = require('../utils/adminNotificationHelper');
 const { uploadProfile, uploadProfileImage, deleteImage } = require('../middleware/upload');
 const adminLoginLimiter = require('../middleware/adminLoginLimiter');
+const adminRegistrationLimiter = require('../middleware/adminRegistrationLimiter');
 const { sendEmail } = require('../middleware/email');
 const bcrypt = require('bcrypt');
 
-// ── POST /api/admin/register ──────────────────────────────────────────────────
-// The first administrator bootstraps the system. Once one exists, only an
-// authenticated administrator can create another account.
-router.post('/register', async (req, res) => {
-  try {
-    const adminCount = await db.Admin.count();
+const escapeHtml = value => String(value ?? '')
+  .replaceAll('&', '&amp;')
+  .replaceAll('<', '&lt;')
+  .replaceAll('>', '&gt;')
+  .replaceAll('"', '&quot;')
+  .replaceAll("'", '&#039;');
 
-    const { username, password, firstName, lastName, email, phone } = req.body;
+// ── POST /api/admin/register ──────────────────────────────────────────────────
+// The first administrator bootstraps the system. Later public applications are
+// stored as pending requests that require super-administrator approval.
+router.post('/register', adminRegistrationLimiter, async (req, res) => {
+  try {
+    const username = String(req.body.username || '').trim();
+    const password = String(req.body.password || '');
+    const firstName = String(req.body.firstName || '').trim();
+    const lastName = String(req.body.lastName || '').trim();
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const phone = String(req.body.phone || '').trim() || null;
 
     if (!username || !password || !email) {
       return res.status(400).json({ error: 'username, password and email are required' });
+    }
+    if (username.length > 50 || firstName.length > 80 || lastName.length > 80 || (phone && phone.length > 20)) {
+      return res.status(400).json({ error: 'Administrator registration details are too long' });
     }
     if (password.length < 8) {
       return res.status(400).json({ error: 'Password must be at least 8 characters' });
     }
 
-    const existing = await db.Admin.findOne({ where: { [db.Sequelize.Op.or]: [{ username }, { email }] } });
-    if (existing) {
-      return res.status(409).json({ error: 'Username already taken' });
-    }
-    const pending = await db.AdminRegistrationRequest.findOne({
-      where: { status: 'pending', [db.Sequelize.Op.or]: [{ username }, { email }] },
-    });
-    if (pending) return res.status(409).json({ error: 'An administrator request is already pending for this username or email' });
-
     const passwordHash = await db.Admin.hashPassword(password);
-    if (adminCount === 0) {
-      const admin = await db.Admin.create({ username, passwordHash, firstName: firstName || '', lastName: lastName || '', email, phone: phone || null, isSuperAdmin: true });
+    const registration = await db.sequelize.transaction(async transaction => {
+      const bootstrapLock = await db.SiteSetting.findByPk(1, {
+        attributes: ['id'],
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+      });
+      if (!bootstrapLock) throw new Error('Administrator bootstrap lock is not initialized');
+
+      const adminCount = await db.Admin.count({ transaction });
+      const existing = await db.Admin.findOne({
+        where: { [db.Sequelize.Op.or]: [{ username }, { email }] },
+        transaction,
+      });
+      if (existing) throw Object.assign(new Error('Username or email is already registered'), { statusCode: 409 });
+      const pending = await db.AdminRegistrationRequest.findOne({
+        where: { status: 'pending', [db.Sequelize.Op.or]: [{ username }, { email }] },
+        transaction,
+      });
+      if (pending) {
+        throw Object.assign(new Error('An administrator request is already pending for this username or email'), { statusCode: 409 });
+      }
+
+      if (adminCount === 0) {
+        const admin = await db.Admin.create({
+          username, passwordHash, firstName, lastName, email, phone, isSuperAdmin: true,
+        }, { transaction });
+        return { approved: true, admin };
+      }
+
+      const request = await db.AdminRegistrationRequest.create({
+        username, passwordHash, firstName, lastName, email, phone,
+      }, { transaction });
+      return { approved: false, request };
+    });
+
+    if (registration.approved) {
+      const { admin } = registration;
       await regenerateSession(req);
       req.session.adminId = admin.id;
       await saveSession(req);
       return res.status(201).json({ message: 'Super administrator account created', admin: safeAdmin(admin), approved: true });
     }
 
-    const request = await db.AdminRegistrationRequest.create({
-      username: username.trim(), passwordHash, firstName: firstName || '', lastName: lastName || '',
-      email: email.trim().toLowerCase(), phone: phone || null,
-    });
+    const { request } = registration;
     const superAdmins = await db.Admin.findAll({ where: { isSuperAdmin: true } });
-    await Promise.all(superAdmins.map(async admin => {
+    const deliveries = await Promise.allSettled(superAdmins.map(async admin => {
       await createAdminNotification({
         adminId: admin.id, type: 'admin_request', title: 'New administrator request',
         message: `${request.firstName || request.username} (${request.email}) requested administrator access.`,
@@ -54,13 +91,24 @@ router.post('/register', async (req, res) => {
       await sendEmail({
         to: admin.email, subject: 'New Vivid Arts administrator request',
         text: `${request.firstName || request.username} (${request.email}) requested administrator access. Sign in to review the request.`,
-        html: `<p><strong>${request.firstName || request.username}</strong> (${request.email}) requested administrator access.</p><p>Sign in to Vivid Arts and open Settings → Admin Requests to approve or reject it.</p>`,
+        html: `<p><strong>${escapeHtml(request.firstName || request.username)}</strong> (${escapeHtml(request.email)}) requested administrator access.</p><p>Sign in to Vivid Arts and open Settings → Admin Requests to approve or reject it.</p>`,
         metadata: { type: 'admin_registration_request', requestId: request.id },
       });
     }));
+    deliveries.filter(result => result.status === 'rejected').forEach(result => {
+      console.error('[admin registration] Notification delivery failed:', result.reason?.message || result.reason);
+    });
     res.status(202).json({ message: 'Your administrator request was submitted for approval.', requestId: request.id, requestToken: request.requestToken, approved: false });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    if (err.name === 'SequelizeUniqueConstraintError') {
+      return res.status(409).json({ error: 'Username or email is already registered' });
+    }
+    if (err.name === 'SequelizeValidationError') {
+      return res.status(400).json({ error: err.errors?.[0]?.message || 'Administrator registration details are invalid' });
+    }
+    res.status(err.statusCode || 500).json({
+      error: err.statusCode ? err.message : 'Unable to submit administrator registration',
+    });
   }
 });
 
@@ -129,7 +177,11 @@ router.get('/me', async (req, res) => {
     const admin = await db.Admin.findByPk(req.session.adminId, {
       attributes: { exclude: ['passwordHash'] },
     });
-    if (!admin) return res.status(404).json({ error: 'Admin not found' });
+    if (!admin?.isActive) {
+      req.session.destroy(() => {});
+      res.clearCookie('vividarts.admin.sid');
+      return res.status(401).json({ error: 'Administrator session is no longer active' });
+    }
     res.json(admin);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -140,8 +192,16 @@ router.get('/me', async (req, res) => {
 router.patch('/profile', requireAdmin, async (req, res) => {
   try {
     const admin = await db.Admin.findByPk(req.session.adminId);
-    const { firstName, lastName, email, phone } = req.body;
-    await admin.update({ firstName, lastName, email, phone });
+    const firstName = String(req.body.firstName ?? admin.firstName ?? '').trim();
+    const lastName = String(req.body.lastName ?? admin.lastName ?? '').trim();
+    const phone = String(req.body.phone ?? admin.phone ?? '').trim() || null;
+    if (req.body.email !== undefined && String(req.body.email).trim().toLowerCase() !== admin.email.toLowerCase()) {
+      return res.status(400).json({ error: 'Administrator email cannot be changed without verification' });
+    }
+    if (firstName.length > 80 || lastName.length > 80 || (phone && phone.length > 20)) {
+      return res.status(400).json({ error: 'Profile details are too long' });
+    }
+    await admin.update({ firstName, lastName, phone });
     res.json({ message: 'Profile updated', admin: safeAdmin(admin) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -254,11 +314,12 @@ router.patch('/profile/image', requireAdmin, (req, res) => {
     if (uploadError) return res.status(400).json({ error: uploadError.message });
     if (!req.file) return res.status(400).json({ error: 'Select a JPG, PNG, or WebP image' });
 
+    let uploaded = null;
     try {
       const admin = await db.Admin.findByPk(req.session.adminId);
       if (!admin) return res.status(404).json({ error: 'Admin not found' });
       const previousPublicId = admin.profileImagePublicId;
-      const uploaded = await uploadProfileImage(req.file, `admin_${admin.id}`);
+      uploaded = await uploadProfileImage(req.file, `admin_${admin.id}`);
       await admin.update({
         profileImageUrl: uploaded.url,
         profileImagePublicId: uploaded.publicId,
@@ -266,6 +327,7 @@ router.patch('/profile/image', requireAdmin, (req, res) => {
       if (previousPublicId) deleteImage(previousPublicId).catch(() => {});
       res.json({ message: 'Profile photo updated', admin: safeAdmin(admin) });
     } catch (error) {
+      if (uploaded?.publicId) await deleteImage(uploaded.publicId).catch(() => {});
       res.status(500).json({ error: error.message || 'Unable to update profile photo' });
     }
   });
@@ -285,6 +347,7 @@ router.patch('/business', requireAdmin, async (req, res) => {
 router.patch('/password', requireAdmin, async (req, res) => {
   try {
     const admin = await db.Admin.findByPk(req.session.adminId);
+    if (!admin) return res.status(404).json({ error: 'Administrator not found' });
     const { currentPassword, newPassword } = req.body;
     if (!(await admin.checkPassword(currentPassword))) {
       return res.status(400).json({ error: 'Current password is incorrect' });
@@ -293,14 +356,35 @@ router.patch('/password', requireAdmin, async (req, res) => {
       return res.status(400).json({ error: 'New password must be at least 8 characters' });
     }
     await admin.update({ passwordHash: await db.Admin.hashPassword(newPassword) });
-    res.json({ message: 'Password updated' });
+    const adminId = admin.id;
+    await db.AdminSession.destroy({
+      where: { data: { [db.Sequelize.Op.like]: `%\"adminId\":\"${adminId}\"%` } },
+    });
+    req.session.destroy(error => {
+      if (error) return res.status(500).json({ error: 'Password changed, but sessions could not be cleared' });
+      res.clearCookie('vividarts.admin.sid');
+      return res.json({ message: 'Password updated. Please sign in again.' });
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── helpers ───────────────────────────────────────────────────────────────────
-function requireAdmin(req, res, next) {
+async function requireAdmin(req, res, next) {
   if (!req.session?.adminId) return res.status(401).json({ error: 'Unauthorized' });
-  next();
+  try {
+    const admin = await db.Admin.findByPk(req.session.adminId, {
+      attributes: ['id', 'isActive', 'isSuperAdmin'],
+    });
+    if (!admin?.isActive) {
+      req.session.destroy(() => {});
+      res.clearCookie('vividarts.admin.sid');
+      return res.status(401).json({ error: 'Administrator session is no longer active' });
+    }
+    req.admin = admin;
+    next();
+  } catch (error) {
+    next(error);
+  }
 }
 
 function safeAdmin(admin) {

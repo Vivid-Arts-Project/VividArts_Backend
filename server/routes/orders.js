@@ -9,6 +9,9 @@ const { paginationFrom, paginationMeta } = require('../utils/pagination');
 const { sendRevisionRequestedAdminEmail } = require('../middleware/email');
 const { uploadReview, deleteImage } = require('../middleware/upload');
 const { ACTIVE_STATUSES, sortProductionQueue } = require('../utils/scheduling');
+const { MAX_INCLUDED_REVISIONS, proofReviewDecision } = require('../utils/proofReviewRules');
+const { normalizeMessage } = require('../utils/messageRules');
+const { requireAdmin } = require('./adminAuth');
 
 router.get('/my-orders', protect, async (req, res) => {
   try {
@@ -51,6 +54,7 @@ router.get('/my-orders', protect, async (req, res) => {
       const amountPaid = completedPayments.reduce((total, payment) => total + Number(payment.amount || 0), 0)
         || Number(order.amount_paid || 0);
       const currentProof = (order.proofImages || []).find(proof => proof.is_current);
+      const revisionRequestsUsed = (order.proofImages || []).filter(proof => proof.review_status === 'revision_requested').length;
       const checkoutDetails = (completedPayments[0] || order.payments?.[0])?.metadata?.order || {};
       const paymentStatus = completedPayments.length ? 'paid' : 'payment_pending';
 
@@ -63,6 +67,8 @@ router.get('/my-orders', protect, async (req, res) => {
         sketchingStartedAt: order.sketching_started_at,
         estimatedCompletionAt: order.estimated_completion_at,
         completedAt: order.completed_at,
+        cancelledAt: order.cancelled_at,
+        cancellationReason: order.cancellation_reason,
         approvedAt: order.approved_at,
         paperSize: product.paper_size,
         subjectCount: product.num_subjects,
@@ -109,6 +115,8 @@ router.get('/my-orders', protect, async (req, res) => {
           revisionNote: currentProof.revision_note,
           uploadedAt: currentProof.createdAt,
           reviewedAt: currentProof.reviewed_at,
+          revisionRequestsUsed,
+          revisionRequestsRemaining: Math.max(0, MAX_INCLUDED_REVISIONS - revisionRequestsUsed),
         } : null,
         proofImagePath: currentProof?.cloudinary_url || null,
         messages: (order.messages || []).map(message => ({
@@ -152,6 +160,7 @@ router.delete('/:id', protect, async (req, res) => {
         lock: transaction.LOCK.UPDATE,
       });
       if (!order) throw Object.assign(new Error('Order not found'), { status: 404 });
+      if (order.status === 'cancelled') throw Object.assign(new Error('Cancelled orders are retained for history and cannot be deleted'), { status: 409 });
 
       const hasCompletedPayment = Number(order.amount_paid || 0) > 0
         || (order.payments || []).some(payment => payment.status === 'completed');
@@ -288,8 +297,9 @@ router.post('/:id/messages', protect, async (req, res) => {
     const order = await db.Order.findOne({ where: { order_id: req.params.id, customer_id: req.user.customerId } });
     if (!order) return res.status(404).json({ error: 'Order not found' });
     if (Number(order.amount_paid || 0) <= 0) return res.status(409).json({ error: 'Complete the deposit payment before messaging the artist' });
-    if (!req.body.message?.trim()) return res.status(400).json({ error: 'Message is required' });
-    const message = await db.Message.create({ order_id: order.order_id, sender_type: 'customer', sender_id: String(req.user.customerId), message_text: req.body.message.trim() });
+    if (order.status === 'cancelled') return res.status(409).json({ error: 'Messaging is closed for cancelled orders' });
+    const messageText = normalizeMessage(req.body.message);
+    const message = await db.Message.create({ order_id: order.order_id, sender_type: 'customer', sender_id: String(req.user.customerId), message_text: messageText });
     await createAdminNotification({
       orderId: order.order_id,
       type: 'message',
@@ -297,61 +307,80 @@ router.post('/:id/messages', protect, async (req, res) => {
       message: `A customer sent a message about order #${order.order_id.slice(0, 8)}.`,
     });
     res.status(201).json(message);
-  } catch (error) { res.status(500).json({ error: error.message }); }
+  } catch (error) { res.status(error.statusCode || 500).json({ error: error.message, code: error.code }); }
 });
 
 router.post('/:id/proof-review', protect, async (req, res) => {
   try {
-    const order = await db.Order.findOne({ 
-      where: { order_id: req.params.id, customer_id: req.user.customerId }, 
-      include: [
-        { model: db.ProofImage, as: 'proofImages' },
-        { model: db.Customer, as: 'customer' }
-      ] 
-    });
-    if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (Number(order.amount_paid || 0) <= 0) return res.status(409).json({ error: 'Complete the deposit payment before reviewing a proof' });
-    const proof = order.proofImages.find(p => p.is_current);
-    if (!proof) return res.status(400).json({ error: 'No proof is awaiting review' });
-    const approved = req.body.action === 'approve';
-    if (!approved && !req.body.note?.trim()) return res.status(400).json({ error: 'Please describe the requested changes' });
-    
-    const revisionNote = req.body.note?.trim() || '';
+    const action = String(req.body.action || '').trim().toLowerCase();
+    const result = await db.sequelize.transaction(async transaction => {
+      const order = await db.Order.findOne({
+        where: { order_id: req.params.id, customer_id: req.user.customerId },
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+      });
+      if (!order) throw Object.assign(new Error('Order not found'), { statusCode: 404 });
+      if (Number(order.amount_paid || 0) <= 0) {
+        throw Object.assign(new Error('Complete the deposit payment before reviewing a proof'), { statusCode: 409 });
+      }
 
-    await proof.update({ 
-      review_status: approved ? 'approved' : 'revision_requested', 
-      revision_note: approved ? null : revisionNote, 
-      reviewed_at: new Date() 
-    });
-    
-    await order.update({ 
-      status: approved ? 'approved' : 'revision_requested', 
-      ...(approved ? { approved_at: new Date() } : {}) 
+      const proof = await db.ProofImage.findOne({
+        where: { order_id: order.order_id, is_current: true },
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+      });
+      if (!proof) throw Object.assign(new Error('No proof is awaiting review'), { statusCode: 400 });
+
+      const revisionRequestsUsed = await db.ProofImage.count({
+        where: { order_id: order.order_id, review_status: 'revision_requested' },
+        transaction,
+      });
+      const decision = proofReviewDecision({
+        action,
+        orderStatus: order.status,
+        proofReviewStatus: proof.review_status,
+        revisionRequestsUsed,
+        note: req.body.note,
+      });
+      const reviewedAt = new Date();
+
+      await proof.update({
+        review_status: decision.approved ? 'approved' : 'revision_requested',
+        revision_note: decision.approved ? null : decision.revisionNote,
+        reviewed_at: reviewedAt,
+      }, { transaction });
+      await order.update({
+        status: decision.approved ? 'approved' : 'revision_requested',
+        ...(decision.approved ? { approved_at: reviewedAt } : {}),
+      }, { transaction });
+      await db.Message.create({
+        order_id: order.order_id,
+        sender_type: 'system',
+        message_text: decision.approved
+          ? 'Customer approved the proof.'
+          : `Customer requested changes: ${decision.revisionNote}`,
+      }, { transaction });
+
+      const customer = await db.Customer.findByPk(order.customer_id, { transaction });
+      return { order, customer, ...decision };
     });
 
-    await db.Message.create({ 
-      order_id: order.order_id, 
-      sender_type: 'system', 
-      message_text: approved ? 'Customer approved the proof.' : `Customer requested changes: ${revisionNote}` 
-    });
-    
-    // In-app notification with revision note
     await createAdminNotification({
-      orderId: order.order_id,
-      type: approved ? 'approval' : 'revision',
-      title: approved ? 'Proof approved' : 'Revision requested',
-      message: approved
-        ? `The customer approved the proof for order #${order.order_id.slice(0, 8)}.`
-        : `Customer requested changes for order #${order.order_id.slice(0, 8)}. Note: "${revisionNote}"`,
+      orderId: result.order.order_id,
+      type: result.approved ? 'approval' : 'revision',
+      title: result.approved ? 'Proof approved' : 'Revision requested',
+      message: result.approved
+        ? `The customer approved the proof for order #${result.order.order_id.slice(0, 8)}.`
+        : `Customer requested changes for order #${result.order.order_id.slice(0, 8)}. Note: "${result.revisionNote}"`,
     });
 
-    if (!approved) {
+    if (!result.approved) {
       try {
         const admins = await db.Admin.findAll();
         await sendRevisionRequestedAdminEmail({
-          order,
-          customerName: order.customer?.full_name || order.customer?.username || 'Customer',
-          revisionNote,
+          order: result.order,
+          customerName: result.customer?.full_name || result.customer?.username || 'Customer',
+          revisionNote: result.revisionNote,
           admins,
           createInAppNotification: createAdminNotification,
         });
@@ -360,8 +389,14 @@ router.post('/:id/proof-review', protect, async (req, res) => {
       }
     }
 
-    res.json({ message: approved ? 'Proof approved' : 'Revision requested', status: order.status });
-  } catch (error) { res.status(500).json({ error: error.message }); }
+    res.json({
+      message: result.approved ? 'Proof approved' : 'Revision requested',
+      status: result.order.status,
+      revisionRequestsRemaining: result.revisionRequestsRemaining,
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message, code: error.code });
+  }
 });
 
 router.get('/notifications', protect, async (req, res) => {
@@ -420,14 +455,8 @@ router.delete('/notifications/:id', protect, async (req, res) => {
   }
 });
 
-router.post('/update-status', async (req, res) => {
+router.post('/update-status', requireAdmin, async (req, res) => {
   try {
-    if (!req.session?.adminId) {
-      return res.status(403).json({
-        message: 'Only trusted admin/backend workflows may update order status notifications.',
-      });
-    }
-
     const { orderId, status, customerId } = req.body;
     if (!orderId) return res.status(400).json({ message: 'orderId is required' });
     if (!status) return res.status(400).json({ message: 'status is required' });

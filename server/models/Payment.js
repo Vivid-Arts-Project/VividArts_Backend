@@ -40,8 +40,11 @@ module.exports = (sequelize, DataTypes) => {
       defaultValue: 'advance',
     },
     paymentMethod: {
-      type: DataTypes.ENUM('card', 'bank'),
+      // legacy_bank is retained only so historical records remain readable.
+      // All new payments are created as PayHere card payments by the routes.
+      type: DataTypes.ENUM('card', 'legacy_bank'),
       allowNull: false,
+      defaultValue: 'card',
     },
     status: {
       type: DataTypes.ENUM('pending', 'completed', 'failed'),
@@ -54,13 +57,14 @@ module.exports = (sequelize, DataTypes) => {
     payhereMd5sig:    { type: DataTypes.STRING, allowNull: true },
     cardLast4:        { type: DataTypes.STRING(4), allowNull: true },
     cardHolderName:   { type: DataTypes.STRING, allowNull: true },
-    bankName:         { type: DataTypes.STRING, allowNull: true },
-    bankReference:    { type: DataTypes.STRING, allowNull: true },
     metadata:         { type: DataTypes.JSON,   allowNull: true },
   }, {
     tableName: 'Payments',
     timestamps: true,
-    indexes: [{ unique: true, fields: ['order_id', 'paymentType'], name: 'payments_order_purpose_unique' }],
+    indexes: [
+      { unique: true, fields: ['order_id', 'paymentType'], name: 'payments_order_purpose_unique' },
+      { unique: true, fields: ['payhereOrderId'], name: 'payments_payhere_order_unique' },
+    ],
   });
 
   // ── Associations ─────────────────────────────────────────────────────────────

@@ -8,6 +8,13 @@ const adminControlsAndSiteSettings = require('./005-admin-controls-and-site-sett
 const existingTableControls = require('./006-existing-table-controls');
 const adminAccountStatus = require('./007-admin-account-status');
 const scheduledOrders = require('./008-scheduled-orders');
+const onlinePaymentsOnly = require('./009-online-payments-only');
+const customerTokenVersion = require('./010-customer-token-version');
+const payhereCallbackIntegrity = require('./011-payhere-callback-integrity');
+const orderWorkflowIntegrity = require('./012-order-workflow-integrity');
+const capacityReservationLock = require('./013-capacity-reservation-lock');
+const emailQueueClaims = require('./014-email-queue-claims');
+const verificationTokenIntegrity = require('./015-verification-token-integrity');
 
 const migrations = [
   baseline,
@@ -19,6 +26,13 @@ const migrations = [
   existingTableControls,
   adminAccountStatus,
   scheduledOrders,
+  onlinePaymentsOnly,
+  customerTokenVersion,
+  payhereCallbackIntegrity,
+  orderWorkflowIntegrity,
+  capacityReservationLock,
+  emailQueueClaims,
+  verificationTokenIntegrity,
 ];
 
 async function runMigrations(db) {

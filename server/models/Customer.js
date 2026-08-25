@@ -36,6 +36,11 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.STRING,
       allowNull: false,
     },
+    token_version: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 0,
+    },
     // OAuth fields (for Google/Facebook login via passport.js)
     provider: {
       type: DataTypes.ENUM('local', 'google', 'facebook'),

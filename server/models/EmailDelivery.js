@@ -52,11 +52,20 @@ module.exports = (sequelize, DataTypes) => sequelize.define('EmailDelivery', {
     type: DataTypes.DATE,
     allowNull: true,
   },
+  lockedAt: {
+    type: DataTypes.DATE,
+    allowNull: true,
+  },
+  lockToken: {
+    type: DataTypes.STRING(64),
+    allowNull: true,
+  },
 }, {
   tableName: 'EmailDeliveries',
   timestamps: true,
   indexes: [
     { fields: ['status', 'nextAttemptAt'] },
+    { fields: ['status', 'lockedAt'] },
     { fields: ['createdAt'] },
   ],
 });

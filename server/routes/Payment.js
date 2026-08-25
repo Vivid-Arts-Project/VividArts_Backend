@@ -10,12 +10,11 @@ const { protect } = require('../middleware/authMiddleware');
 const { uploadReferences, deleteImage } = require('../middleware/upload');
 const { createAdminNotification } = require('../utils/adminNotificationHelper');
 const { ACTIVE_STATUSES, buildTimelinePreview, hasScheduledSlotConflict, requiredScheduledStart } = require('../utils/scheduling');
-const { balanceCheckoutDecision, paymentCallbackDecision, paymentSummary } = require('../utils/paymentRules');
-
-const requireAdmin = (req, res, next) => {
-  if (!req.session?.adminId) return res.status(401).json({ error: 'Unauthorized' });
-  next();
-};
+const { balanceCheckoutDecision, hasUsableCheckout, paymentCallbackDecision, paymentSummary } = require('../utils/paymentRules');
+const { onlinePaymentMethod } = require('../utils/paymentMethod');
+const { assertPayhereCallbackAuthenticity } = require('../utils/payhereSecurity');
+const { hasLiveCapacityReservation, isReusableDepositCheckout } = require('../utils/capacityReservation');
+const { requireAdmin } = require('./adminAuth');
 
 const requireCustomer = (req, res, next) => {
   protect(req, res, () => {
@@ -26,8 +25,10 @@ const requireCustomer = (req, res, next) => {
 
 const requirePaymentViewer = (req, res, next) => {
   if (req.session?.adminId) {
-    req.isAdminViewer = true;
-    return next();
+    return requireAdmin(req, res, () => {
+      req.isAdminViewer = true;
+      next();
+    });
   }
   return requireCustomer(req, res, next);
 };
@@ -55,9 +56,6 @@ const requireOwnedPayment = async (req, res, next) => {
 // Currency rates
 const CURRENCIES = {
   LKR: { rate: 1, symbol: 'Rs' },
-  USD: { rate: 0.0031, symbol: '$' },
-  AED: { rate: 0.011, symbol: 'د.إ' },
-  GBP: { rate: 0.0024, symbol: '£' }
 };
 
 // Normalize copied dashboard values so PayHere's exact-match hash stays stable.
@@ -73,12 +71,9 @@ const PAYHERE_NOTIFY_URL = envValue('PAYHERE_NOTIFY_URL') || `${BACKEND_URL}/api
 const PAYHERE_CHECKOUT_URL = PAYHERE_SANDBOX === 'false'
   ? 'https://www.payhere.lk/pay/checkout'
   : 'https://sandbox.payhere.lk/pay/checkout';
-const PAYHERE_ALLOWED_CURRENCIES = (process.env.PAYHERE_ALLOWED_CURRENCIES || 'LKR')
-  .split(',')
-  .map((currency) => currency.trim().toUpperCase())
-  .filter(Boolean);
+const PAYHERE_ALLOWED_CURRENCIES = ['LKR'];
 
-const createOrderId = () => `ORD-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+const createOrderId = () => `ORD-${crypto.randomUUID()}`;
 const localDateOnly = (date) => date
   ? `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
   : null;
@@ -86,18 +81,47 @@ const localDateOnly = (date) => date
 const URGENT_ORDER_LIMIT = 2;
 const URGENT_WINDOW_DAYS = 10;
 const SCHEDULED_WINDOW_DAYS = 15;
+const CAPACITY_RESERVATION_MINUTES = Math.max(5, Number(process.env.CAPACITY_RESERVATION_MINUTES) || 60);
 
-const getUrgentAvailability = async (transaction) => {
-  const windowStart = new Date();
-  windowStart.setDate(windowStart.getDate() - URGENT_WINDOW_DAYS);
-  const accepted = await db.Order.count({
+const acquireCapacityLock = async (transaction) => {
+  if (!transaction) return;
+  const lockRow = await db.SiteSetting.findByPk(1, {
+    attributes: ['id'],
+    transaction,
+    lock: transaction.LOCK.UPDATE,
+  });
+  if (!lockRow) throw new Error('The scheduling capacity lock is not initialized');
+};
+
+const getCapacityOrders = async ({ transaction, excludeOrderId = null } = {}) => {
+  const orders = await db.Order.findAll({
     where: {
-      is_urgent: true,
-      amount_paid: { [db.Sequelize.Op.gt]: 0 },
-      createdAt: { [db.Sequelize.Op.gte]: windowStart },
+      status: { [db.Sequelize.Op.in]: ACTIVE_STATUSES },
+      ...(excludeOrderId ? { order_id: { [db.Sequelize.Op.ne]: excludeOrderId } } : {}),
     },
+    include: [
+      { model: db.ProductOption, as: 'productOption' },
+      {
+        model: db.Payment,
+        as: 'payments',
+        attributes: ['paymentType', 'status', 'updatedAt'],
+        required: false,
+      },
+    ],
     transaction,
   });
+  return orders.filter(order => hasLiveCapacityReservation(order, {
+    reservationMinutes: CAPACITY_RESERVATION_MINUTES,
+  }));
+};
+
+const getUrgentAvailability = async ({ transaction, excludeOrderId = null } = {}) => {
+  const windowStart = new Date();
+  windowStart.setDate(windowStart.getDate() - URGENT_WINDOW_DAYS);
+  const capacityOrders = await getCapacityOrders({ transaction, excludeOrderId });
+  const accepted = capacityOrders.filter(order => (
+    order.is_urgent && new Date(order.createdAt) >= windowStart
+  )).length;
   return {
     limit: URGENT_ORDER_LIMIT,
     windowDays: URGENT_WINDOW_DAYS,
@@ -106,9 +130,9 @@ const getUrgentAvailability = async (transaction) => {
   };
 };
 
-const assertUrgentAvailability = async (computedOrder, transaction) => {
+const assertUrgentAvailability = async (computedOrder, transaction, excludeOrderId = null) => {
   if (!computedOrder.urgent) return;
-  const availability = await getUrgentAvailability(transaction);
+  const availability = await getUrgentAvailability({ transaction, excludeOrderId });
   if (availability.remaining === 0) {
     const error = new Error('Urgent-order capacity is currently full. Only 2 urgent orders can be accepted in each 10-day period. Please choose a standard order or contact us for the next available urgent date.');
     error.statusCode = 409;
@@ -117,13 +141,9 @@ const assertUrgentAvailability = async (computedOrder, transaction) => {
   }
 };
 
-const assertScheduledAvailability = async (computedOrder, transaction) => {
+const assertScheduledAvailability = async (computedOrder, transaction, excludeOrderId = null) => {
   if (!computedOrder.scheduled) return;
-  const orders = await db.Order.findAll({
-    where: { status: { [db.Sequelize.Op.in]: ACTIVE_STATUSES }, amount_paid: { [db.Sequelize.Op.gt]: 0 } },
-    include: [{ model: db.ProductOption, as: 'productOption' }],
-    transaction,
-  });
+  const orders = await getCapacityOrders({ transaction, excludeOrderId });
   const timeline = buildTimelinePreview(orders, computedOrder);
   const conflictingOrder = hasScheduledSlotConflict(orders, computedOrder, SCHEDULED_WINDOW_DAYS);
   if (!timeline.feasible || conflictingOrder) {
@@ -138,26 +158,25 @@ const assertScheduledAvailability = async (computedOrder, transaction) => {
   return { timeline, slotAvailable: true };
 };
 
-const createCommission = async (req, computedOrder, payment) => {
+const createCommission = async (req, computedOrder, payment, transaction) => {
   const customerId = req.customerId;
-  return db.sequelize.transaction(async transaction => {
-    await assertUrgentAvailability(computedOrder, transaction);
-    await assertScheduledAvailability(computedOrder, transaction);
-    const product = await db.ProductOption.create({
-      paper_size: computedOrder.sizeId, num_subjects: computedOrder.people,
-      frame_type: computedOrder.frameId === 'none' ? 'without_frame' : computedOrder.frameId === 'premium' ? 'wooden_frame' : 'plastic_frame',
-      pickup_option: computedOrder.deliveryMethod, is_urgent: computedOrder.urgent,
-      urgent_deadline: computedOrder.urgentDeadline, is_scheduled: computedOrder.scheduled,
-      scheduled_date: computedOrder.scheduledDate,
-      scheduled_start_date: computedOrder.scheduled ? localDateOnly(requiredScheduledStart(computedOrder)) : null,
-      customer_note: computedOrder.notes,
-    }, { transaction });
-    const order = await db.Order.create({ customer_id: customerId, product_id: product.product_id,
-      calculated_price: computedOrder.total, payment_type: 'advance', amount_paid: 0,
-      status: 'in_queue', is_urgent: computedOrder.urgent, is_scheduled: computedOrder.scheduled }, { transaction });
-    await payment.update({ order_id: order.order_id }, { transaction });
-    return order;
-  });
+  await acquireCapacityLock(transaction);
+  await assertUrgentAvailability(computedOrder, transaction);
+  await assertScheduledAvailability(computedOrder, transaction);
+  const product = await db.ProductOption.create({
+    paper_size: computedOrder.sizeId, num_subjects: computedOrder.people,
+    frame_type: computedOrder.frameId === 'none' ? 'without_frame' : computedOrder.frameId === 'premium' ? 'wooden_frame' : 'plastic_frame',
+    pickup_option: computedOrder.deliveryMethod, is_urgent: computedOrder.urgent,
+    urgent_deadline: computedOrder.urgentDeadline, is_scheduled: computedOrder.scheduled,
+    scheduled_date: computedOrder.scheduledDate,
+    scheduled_start_date: computedOrder.scheduled ? localDateOnly(requiredScheduledStart(computedOrder)) : null,
+    customer_note: computedOrder.notes,
+  }, { transaction });
+  const order = await db.Order.create({ customer_id: customerId, product_id: product.product_id,
+    calculated_price: computedOrder.total, payment_type: 'advance', amount_paid: 0,
+    status: 'in_queue', is_urgent: computedOrder.urgent, is_scheduled: computedOrder.scheduled }, { transaction });
+  await payment.update({ order_id: order.order_id }, { transaction });
+  return order;
 };
 
 router.post('/orders/:id/reference-photos', requireCustomer, async (req, res) => {
@@ -176,25 +195,41 @@ router.post('/orders/:id/reference-photos', requireCustomer, async (req, res) =>
     if (!req.files?.length) return res.status(400).json({ success: false, error: 'Select at least one reference photo' });
 
     try {
-      const existingCount = await db.ReferencePhoto.count({ where: { order_id: order.order_id } });
-      if (existingCount + req.files.length > 5) {
-        await Promise.all(req.files.map(file => deleteImage(file.filename).catch(() => {})));
-        return res.status(400).json({ success: false, error: 'An order can have up to 5 reference photos' });
-      }
-
-      const photos = await db.ReferencePhoto.bulkCreate(req.files.map((file, index) => ({
-        order_id: order.order_id,
-        cloudinary_url: file.path,
-        cloudinary_public_id: file.filename,
-        original_filename: file.originalname,
-        file_size_bytes: file.size,
-        mime_type: file.mimetype,
-        sort_order: existingCount + index,
-      })));
+      const photos = await db.sequelize.transaction(async transaction => {
+        const lockedOrder = await db.Order.findOne({
+          where: { order_id: order.order_id, customer_id: req.customerId },
+          attributes: ['order_id', 'status', 'amount_paid'],
+          transaction,
+          lock: transaction.LOCK.UPDATE,
+        });
+        if (!lockedOrder) throw Object.assign(new Error('Order not found'), { statusCode: 404 });
+        if (lockedOrder.status !== 'in_queue' || Number(lockedOrder.amount_paid || 0) > 0) {
+          throw Object.assign(new Error('Reference photos can only be added before the deposit is paid'), { statusCode: 409 });
+        }
+        const existingCount = await db.ReferencePhoto.count({
+          where: { order_id: lockedOrder.order_id },
+          transaction,
+        });
+        if (existingCount + req.files.length > 5) {
+          throw Object.assign(new Error('An order can have up to 5 reference photos'), { statusCode: 400 });
+        }
+        return db.ReferencePhoto.bulkCreate(req.files.map((file, index) => ({
+          order_id: lockedOrder.order_id,
+          cloudinary_url: file.path,
+          cloudinary_public_id: file.filename,
+          original_filename: file.originalname,
+          file_size_bytes: file.size,
+          mime_type: file.mimetype,
+          sort_order: existingCount + index,
+        })), { transaction });
+      });
       res.status(201).json({ success: true, photos: photos.map(photo => photo.cloudinary_url) });
     } catch (error) {
       await Promise.all(req.files.map(file => deleteImage(file.filename).catch(() => {})));
-      res.status(500).json({ success: false, error: 'Unable to save reference photos' });
+      res.status(error.statusCode || 500).json({
+        success: false,
+        error: error.statusCode ? error.message : 'Unable to save reference photos',
+      });
     }
   });
 });
@@ -232,6 +267,14 @@ const validatePayhereConfig = () => {
   return null;
 };
 
+const validatePayhereCallbackConfig = () => {
+  if (isPlaceholderValue(PAYHERE_MERCHANT_ID) || isPlaceholderValue(PAYHERE_MERCHANT_SECRET)) {
+    return 'PayHere callback credentials are not configured';
+  }
+  if (!/^\d{7}$/.test(PAYHERE_MERCHANT_ID)) return 'PayHere merchant ID is invalid';
+  return null;
+};
+
 const calculateDisplayAmount = (amount, currency) => {
   const rate = CURRENCIES[currency]?.rate || 1;
   return (amount * rate).toFixed(2);
@@ -255,21 +298,26 @@ const mapPayhereStatus = (statusCode) => {
   return 'pending';
 };
 
-const syncLinkedOrderPayment = async (payment) => {
+const syncLinkedOrderPayment = async (payment, transaction) => {
   if (!payment.order_id) return;
+  const order = await db.Order.findByPk(payment.order_id, {
+    attributes: ['calculated_price'],
+    transaction,
+    lock: transaction ? transaction.LOCK.UPDATE : undefined,
+  });
+  if (!order) return;
   const completed = await Payment.sum('amount', {
     where: { order_id: payment.order_id, status: 'completed' },
+    transaction,
   });
-  const order = await db.Order.findByPk(payment.order_id, { attributes: ['calculated_price'] });
   const paidInFull = order && Number(completed || 0) >= Number(order.calculated_price || 0);
   await db.Order.update(
     { amount_paid: Number(completed || 0), payment_type: paidInFull ? 'full' : 'advance' },
-    { where: { order_id: payment.order_id } },
+    { where: { order_id: payment.order_id }, transaction },
   );
 };
 
 const completeInitialOrderPayment = async (payment) => {
-  await syncLinkedOrderPayment(payment);
   if (payment.status !== 'completed' || payment.metadata?.balancePayment) return;
 
   const computedOrder = payment.metadata?.order || {};
@@ -324,7 +372,7 @@ router.get('/queue-position', requireCustomer, async (_req, res) => {
   try {
     const activeOrders = await db.Order.count({
       where: {
-        status: { [db.Sequelize.Op.ne]: 'done' },
+        status: { [db.Sequelize.Op.notIn]: ['done', 'cancelled'] },
         amount_paid: { [db.Sequelize.Op.gt]: 0 },
       },
     });
@@ -343,16 +391,23 @@ router.get('/queue-position', requireCustomer, async (_req, res) => {
 // 1. Create Payment Order
 router.post('/create-order', requireCustomer, async (req, res) => {
   try {
-    const { currency, paymentMethod, bankDetails, order, customer = {} } = req.body;
+    const { currency, paymentMethod, order, customer = {} } = req.body;
+    const selectedPaymentMethod = onlinePaymentMethod(paymentMethod);
+    const selectedCurrency = String(currency || 'LKR').trim().toUpperCase();
+    if (!PAYHERE_ALLOWED_CURRENCIES.includes(selectedCurrency)) {
+      return res.status(400).json({
+        success: false,
+        error: `PayHere is configured for ${PAYHERE_ALLOWED_CURRENCIES.join(', ')} only.`,
+        code: 'UNSUPPORTED_PAYMENT_CURRENCY',
+      });
+    }
     const computedOrder = await calculateOrder(order);
-    await assertUrgentAvailability(computedOrder);
-    await assertScheduledAvailability(computedOrder);
 
     const orderData = {
       payhereOrderId: createOrderId(),
       amount: computedOrder.dueAmount,
-      currency: currency || 'LKR',
-      paymentMethod: paymentMethod || 'card',
+      currency: selectedCurrency,
+      paymentMethod: selectedPaymentMethod,
       status: 'pending',
       metadata: {
         order: computedOrder,
@@ -366,13 +421,13 @@ router.post('/create-order', requireCustomer, async (req, res) => {
           country: customer.country || null,
         },
       },
-      ...(paymentMethod === 'bank' && bankDetails ? {
-        bankName: bankDetails.bankName || null
-      } : {})
     };
 
-    const payment = await Payment.create(orderData);
-    const commission = await createCommission(req, computedOrder, payment);
+    const { payment, commission } = await db.sequelize.transaction(async transaction => {
+      const createdPayment = await Payment.create(orderData, { transaction });
+      const createdCommission = await createCommission(req, computedOrder, createdPayment, transaction);
+      return { payment: createdPayment, commission: createdCommission };
+    });
     res.status(201).json({
       success: true,
       payment: {
@@ -394,127 +449,79 @@ router.post('/create-order', requireCustomer, async (req, res) => {
   }
 });
 
-// 2. Create PayHere checkout payload for card payments
-router.post('/create-payhere-checkout', requireCustomer, async (req, res) => {
-  try {
-    const configError = validatePayhereConfig();
-    if (configError) {
-      return res.status(500).json({
-        success: false,
-        error: configError
-      });
-    }
-
-    const { currency = 'LKR', customer = {}, order } = req.body;
-    const selectedCurrency = CURRENCIES[currency] ? currency : 'LKR';
-    if (!PAYHERE_ALLOWED_CURRENCIES.includes(selectedCurrency)) {
-      return res.status(400).json({
-        success: false,
-        error: `PayHere is configured for ${PAYHERE_ALLOWED_CURRENCIES.join(', ')} only. Select LKR or add the currency to PAYHERE_ALLOWED_CURRENCIES after PayHere enables it.`
-      });
-    }
-
-    const computedOrder = await calculateOrder(order);
-    await assertUrgentAvailability(computedOrder);
-    await assertScheduledAvailability(computedOrder);
-    const payment = await Payment.create({
-      payhereOrderId: createOrderId(),
-      amount: computedOrder.dueAmount,
-      currency: selectedCurrency,
-      paymentMethod: 'card',
-      status: 'pending'
-    });
-    const commission = await createCommission(req, computedOrder, payment);
-    const { hash, fields: checkoutFields } = buildInitialCheckout({ payment, customer });
-
-    await payment.update({
-      payhereMd5sig: hash,
-      metadata: {
-        checkoutAmount: checkoutFields.amount,
-        checkoutCurrency: selectedCurrency,
-        order: computedOrder,
-        customer: {
-          firstName: customer.firstName || 'Vivid',
-          lastName: customer.lastName || null,
-          email: customer.email || null,
-          phone: customer.phone || null,
-          address: customer.address || null,
-          city: customer.city || null,
-          country: customer.country || null
-        }
-      }
-    });
-
-    await syncLinkedOrderPayment(payment);
-
-    res.status(201).json({
-      success: true,
-      checkoutUrl: PAYHERE_CHECKOUT_URL,
-      checkoutFields,
-      orderId: payment.payhereOrderId
-      , commissionId: commission.order_id
-    });
-  } catch (error) {
-    console.error('Error creating PayHere checkout:', error);
-    res.status(error.statusCode || 500).json({
-      success: false,
-      error: error.statusCode ? error.message : 'Failed to create PayHere checkout',
-      code: error.code,
-    });
-  }
-});
-
 // Re-open the deposit checkout for a commission that the customer left unpaid.
 router.post('/orders/:id/resume-checkout', requireCustomer, async (req, res) => {
   try {
     const configError = validatePayhereConfig();
     if (configError) return res.status(500).json({ success: false, error: configError });
 
-    const order = await db.Order.findOne({
-      where: { order_id: req.params.id, customer_id: req.customerId },
-      include: [
-        { model: db.Payment, as: 'payments' },
-        { model: db.Customer, as: 'customer' },
-        { model: db.ProductOption, as: 'productOption' },
-      ],
-    });
-    if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
-    if (Number(order.amount_paid || 0) > 0) {
-      return res.status(400).json({ success: false, error: 'The deposit for this order is already paid' });
-    }
+    const { order, payment, fields, reused } = await db.sequelize.transaction(async transaction => {
+      await acquireCapacityLock(transaction);
+      const lockedOrder = await db.Order.findOne({
+        where: { order_id: req.params.id, customer_id: req.customerId },
+        include: [
+          { model: db.Payment, as: 'payments' },
+          { model: db.Customer, as: 'customer' },
+          { model: db.ProductOption, as: 'productOption' },
+        ],
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+      });
+      if (!lockedOrder) throw Object.assign(new Error('Order not found'), { statusCode: 404 });
+      if (lockedOrder.status === 'cancelled') throw Object.assign(new Error('This order was cancelled and cannot accept payment'), { statusCode: 409 });
+      if (Number(lockedOrder.amount_paid || 0) > 0) {
+        throw Object.assign(new Error('The deposit for this order is already paid'), { statusCode: 400 });
+      }
 
-    const payment = order.payments?.find(item => item.paymentType === 'advance');
-    if (!payment || payment.status === 'completed') {
-      return res.status(400).json({ success: false, error: 'No pending deposit was found for this order' });
-    }
+      const lockedPayment = lockedOrder.payments?.find(item => item.paymentType === 'advance');
+      if (!lockedPayment || lockedPayment.status === 'completed') {
+        throw Object.assign(new Error('No pending deposit was found for this order'), { statusCode: 400 });
+      }
+      const capacityRequest = {
+        urgent: Boolean(lockedOrder.is_urgent || lockedOrder.productOption?.is_urgent),
+        scheduled: Boolean(lockedOrder.is_scheduled || lockedOrder.productOption?.is_scheduled),
+        scheduledDate: lockedOrder.productOption?.scheduled_date,
+        people: lockedOrder.productOption?.num_subjects,
+        frameId: lockedOrder.productOption?.frame_type,
+        deliveryMethod: lockedOrder.productOption?.pickup_option,
+      };
+      await assertUrgentAvailability(capacityRequest, transaction, lockedOrder.order_id);
+      await assertScheduledAvailability(capacityRequest, transaction, lockedOrder.order_id);
 
-    const fullName = (order.customer?.full_name || order.customer?.username || 'Vivid Customer').trim();
-    const [firstName, ...lastNameParts] = fullName.split(/\s+/);
-    const storedCustomer = payment.metadata?.customer || {};
-    const customerDetails = {
-      firstName: storedCustomer.firstName || firstName,
-      lastName: storedCustomer.lastName || lastNameParts.join(' ') || '-',
-      email: storedCustomer.email || order.customer?.email,
-      phone: storedCustomer.phone || order.customer?.phone_number,
-      address: storedCustomer.address || order.customer?.address,
-      city: storedCustomer.city || 'Colombo',
-      country: storedCustomer.country || 'Sri Lanka',
-    };
-    await payment.update({
-      payhereOrderId: createOrderId(),
-      status: 'pending',
-      completedAt: null,
-      transactionId: null,
-      payherePaymentId: null,
-    });
-    const { hash, gatewayAmount, fields } = buildInitialCheckout({ payment, customer: customerDetails });
-    await payment.update({
-      payhereMd5sig: hash,
-      metadata: {
-        ...(payment.metadata || {}),
-        checkoutAmount: gatewayAmount,
-        checkoutCurrency: payment.currency,
-      },
+      const fullName = (lockedOrder.customer?.full_name || lockedOrder.customer?.username || 'Vivid Customer').trim();
+      const [firstName, ...lastNameParts] = fullName.split(/\s+/);
+      const storedCustomer = lockedPayment.metadata?.customer || {};
+      const customerDetails = {
+        firstName: storedCustomer.firstName || firstName,
+        lastName: storedCustomer.lastName || lastNameParts.join(' ') || '-',
+        email: storedCustomer.email || lockedOrder.customer?.email,
+        phone: storedCustomer.phone || lockedOrder.customer?.phone_number,
+        address: storedCustomer.address || lockedOrder.customer?.address,
+        city: storedCustomer.city || 'Colombo',
+        country: storedCustomer.country || 'Sri Lanka',
+      };
+      if (isReusableDepositCheckout(lockedPayment)) {
+        const checkout = buildInitialCheckout({ payment: lockedPayment, customer: customerDetails });
+        return { order: lockedOrder, payment: lockedPayment, fields: checkout.fields, reused: true };
+      }
+      await lockedPayment.update({
+        payhereOrderId: createOrderId(),
+        status: 'pending',
+        completedAt: null,
+        transactionId: null,
+        payherePaymentId: null,
+      }, { transaction });
+      const checkout = buildInitialCheckout({ payment: lockedPayment, customer: customerDetails });
+      await lockedPayment.update({
+        payhereMd5sig: checkout.hash,
+        metadata: {
+          ...(lockedPayment.metadata || {}),
+          checkoutAmount: checkout.gatewayAmount,
+          checkoutCurrency: lockedPayment.currency,
+          capacityReservedUntil: new Date(Date.now() + CAPACITY_RESERVATION_MINUTES * 60 * 1000).toISOString(),
+        },
+      }, { transaction });
+      return { order: lockedOrder, payment: lockedPayment, fields: checkout.fields, reused: false };
     });
 
     res.status(201).json({
@@ -523,22 +530,21 @@ router.post('/orders/:id/resume-checkout', requireCustomer, async (req, res) => 
       checkoutFields: fields,
       orderId: payment.payhereOrderId,
       commissionId: order.order_id,
+      reused,
     });
   } catch (error) {
     console.error('Error resuming PayHere checkout:', error);
-    res.status(500).json({ success: false, error: 'Unable to resume payment' });
+    res.status(error.statusCode || 500).json({
+      success: false,
+      error: error.statusCode ? error.message : 'Unable to resume payment',
+      code: error.code,
+    });
   }
 });
 
 router.post('/timeline-preview', requireCustomer, async (req, res) => {
   try {
-    const orders = await db.Order.findAll({
-      where: {
-        status: { [db.Sequelize.Op.in]: ACTIVE_STATUSES },
-        amount_paid: { [db.Sequelize.Op.gt]: 0 },
-      },
-      include: [{ model: db.ProductOption, as: 'productOption' }],
-    });
+    const orders = await getCapacityOrders();
     const proposedOrder = {
       urgent: req.body?.urgent === true,
       urgentDeadline: req.body?.urgentDeadline || null,
@@ -558,15 +564,6 @@ router.post('/timeline-preview', requireCustomer, async (req, res) => {
       } else timeline.slotAvailable = true;
       timeline.scheduledWindowDays = SCHEDULED_WINDOW_DAYS;
     }
-    if (order.is_scheduled || order.productOption?.is_scheduled) {
-      await assertScheduledAvailability({
-        scheduled: true,
-        scheduledDate: order.productOption?.scheduled_date,
-        people: order.productOption?.num_subjects,
-        frameId: order.productOption?.frame_type,
-        deliveryMethod: order.productOption?.pickup_option,
-      });
-    }
     res.json({ success: true, timeline });
   } catch (error) {
     console.error('Error calculating timeline preview:', error);
@@ -576,7 +573,7 @@ router.post('/timeline-preview', requireCustomer, async (req, res) => {
 
 router.get('/urgent-availability', async (_req, res) => {
   try {
-    const availability = await getUrgentAvailability();
+    const availability = await getUrgentAvailability({});
     res.json({ success: true, ...availability, available: availability.remaining > 0 });
   } catch (error) {
     console.error('Error fetching urgent-order availability:', error);
@@ -603,12 +600,25 @@ router.post('/orders/:id/balance-checkout', requireCustomer, async (req, res) =>
         error.statusCode = 404;
         throw error;
       }
+      if (order.status === 'cancelled') {
+        const error = new Error('This order was cancelled and cannot accept payment');
+        error.statusCode = 409;
+        throw error;
+      }
       const payments = await Payment.findAll({
         where: { order_id: order.order_id },
         order: [['paymentId', 'ASC']],
         transaction,
         lock: transaction.LOCK.UPDATE,
       });
+      const incompletePendingBalance = payments.find(payment => (
+        payment.paymentType === 'full'
+        && payment.status === 'pending'
+        && !hasUsableCheckout(payment)
+      ));
+      if (incompletePendingBalance) {
+        await incompletePendingBalance.update({ status: 'failed' }, { transaction });
+      }
       const decision = balanceCheckoutDecision({
         orderStatus: order.status,
         total: order.calculated_price,
@@ -643,49 +653,47 @@ router.post('/orders/:id/balance-checkout', requireCustomer, async (req, res) =>
           status: 'pending',
         }, { transaction });
       }
-      return { order, balance: decision.balance, payment, currency };
+      const gatewayAmount = calculateDisplayAmount(decision.balance, currency);
+      const hash = createPayhereCheckoutHash({
+        merchantId: PAYHERE_MERCHANT_ID, orderId: payment.payhereOrderId,
+        amount: gatewayAmount, currency, merchantSecret: PAYHERE_MERCHANT_SECRET,
+      });
+      const fullName = (order.customer?.full_name || order.customer?.username || 'Vivid Customer').trim();
+      const [firstName, ...lastNameParts] = fullName.split(/\s+/);
+      const checkoutFields = {
+        merchant_id: PAYHERE_MERCHANT_ID,
+        return_url: `${FRONTEND_URL}/commission/payment?payment=success&order_id=${payment.payhereOrderId}`,
+        cancel_url: `${FRONTEND_URL}/my-orders`,
+        notify_url: PAYHERE_NOTIFY_URL,
+        order_id: payment.payhereOrderId,
+        items: `Vivid Arts order ${order.order_id.slice(0, 8)} balance`,
+        currency, amount: gatewayAmount,
+        first_name: firstName || 'Vivid', last_name: lastNameParts.join(' ') || '-',
+        email: order.customer?.email || 'customer@example.com',
+        phone: order.customer?.phone_number || '0771234567',
+        address: order.customer?.address || 'Colombo', city: 'Colombo', country: 'Sri Lanka', hash,
+      };
+      await payment.update({
+        payhereMd5sig: hash,
+        metadata: {
+          ...(payment.metadata || {}),
+          balancePayment: true,
+          checkoutAmount: gatewayAmount,
+          checkoutCurrency: currency,
+          customer: {
+            firstName: firstName || 'Vivid',
+            lastName: lastNameParts.join(' ') || '-',
+            email: order.customer?.email,
+            phone: order.customer?.phone_number,
+            address: order.customer?.address,
+            city: 'Colombo',
+            country: 'Sri Lanka',
+          },
+        },
+      }, { transaction });
+      return { payment, checkoutFields };
     });
-    const { order, balance, payment, currency } = checkout;
-
-    const gatewayAmount = calculateDisplayAmount(balance, currency);
-    const hash = createPayhereCheckoutHash({
-      merchantId: PAYHERE_MERCHANT_ID, orderId: payment.payhereOrderId,
-      amount: gatewayAmount, currency, merchantSecret: PAYHERE_MERCHANT_SECRET,
-    });
-    const fullName = (order.customer?.full_name || order.customer?.username || 'Vivid Customer').trim();
-    const [firstName, ...lastNameParts] = fullName.split(/\s+/);
-    const checkoutFields = {
-      merchant_id: PAYHERE_MERCHANT_ID,
-      return_url: `${FRONTEND_URL}/commission/payment?payment=success&order_id=${payment.payhereOrderId}`,
-      cancel_url: `${FRONTEND_URL}/my-orders`,
-      notify_url: PAYHERE_NOTIFY_URL,
-      order_id: payment.payhereOrderId,
-      items: `Vivid Arts order ${order.order_id.slice(0, 8)} balance`,
-      currency, amount: gatewayAmount,
-      first_name: firstName || 'Vivid', last_name: lastNameParts.join(' ') || '-',
-      email: order.customer?.email || 'customer@example.com',
-      phone: order.customer?.phone_number || '0771234567',
-      address: order.customer?.address || 'Colombo', city: 'Colombo', country: 'Sri Lanka', hash,
-    };
-    const customerDetails = {
-      firstName: firstName || 'Vivid',
-      lastName: lastNameParts.join(' ') || '-',
-      email: order.customer?.email,
-      phone: order.customer?.phone_number,
-      address: order.customer?.address,
-      city: 'Colombo',
-      country: 'Sri Lanka',
-    };
-    await payment.update({
-      payhereMd5sig: hash,
-      metadata: {
-        ...(payment.metadata || {}),
-        balancePayment: true,
-        checkoutAmount: gatewayAmount,
-        checkoutCurrency: currency,
-        customer: customerDetails,
-      },
-    });
+    const { payment, checkoutFields } = checkout;
     res.status(201).json({ success: true, checkoutUrl: PAYHERE_CHECKOUT_URL, checkoutFields, orderId: payment.payhereOrderId });
   } catch (error) {
     console.error('Error creating balance checkout:', error);
@@ -715,14 +723,10 @@ router.post('/payhere-notify', async (req, res) => {
       status_message
     } = req.body;
 
-    const payment = await Payment.findOne({ where: { payhereOrderId: order_id } });
-
-    if (!payment) {
-      return res.status(404).send('Payment record not found');
-    }
-
+    const configError = validatePayhereCallbackConfig();
+    if (configError) return res.status(503).send('Payment callback is not configured');
     const localMd5sig = createPayhereNotifyHash({
-      merchantId: merchant_id,
+      merchantId: PAYHERE_MERCHANT_ID,
       orderId: order_id,
       amount: payhere_amount,
       currency: payhere_currency,
@@ -730,54 +734,93 @@ router.post('/payhere-notify', async (req, res) => {
       merchantSecret: PAYHERE_MERCHANT_SECRET
     });
 
-    if (localMd5sig !== md5sig) {
-      if (payment.status === 'completed') return res.status(400).send('Invalid signature');
-      await payment.update({
-        status: 'failed',
-        metadata: {
-          ...(payment.metadata || {}),
-          payhereStatusMessage: 'Invalid PayHere signature',
-          receivedMd5sig: md5sig
-        }
+    try {
+      assertPayhereCallbackAuthenticity({
+        receivedMerchantId: merchant_id,
+        configuredMerchantId: PAYHERE_MERCHANT_ID,
+        receivedSignature: md5sig,
+        expectedSignature: localMd5sig,
       });
-
-      return res.status(400).send('Invalid signature');
+    } catch (error) {
+      console.warn(`Rejected PayHere callback: ${error.code}`);
+      return res.status(error.statusCode || 400).send(error.message);
     }
 
     const nextStatus = mapPayhereStatus(status_code);
-    let callbackDecision;
+    let payment;
+    let newlyCompleted = false;
     try {
-      callbackDecision = paymentCallbackDecision({
-        currentStatus: payment.status,
-        nextStatus,
-        expectedAmount: payment.amount,
-        receivedAmount: payhere_amount,
-        expectedCurrency: payment.currency,
-        receivedCurrency: payhere_currency,
-      });
+      ({ payment, newlyCompleted } = await db.sequelize.transaction(async transaction => {
+        await acquireCapacityLock(transaction);
+        const lockedPayment = await Payment.findOne({
+          where: { payhereOrderId: order_id },
+          transaction,
+          lock: transaction.LOCK.UPDATE,
+        });
+        if (!lockedPayment) return { payment: null, newlyCompleted: false };
+
+        const callbackDecision = paymentCallbackDecision({
+          currentStatus: lockedPayment.status,
+          nextStatus,
+          expectedAmount: lockedPayment.amount,
+          receivedAmount: payhere_amount,
+          expectedCurrency: lockedPayment.currency,
+          receivedCurrency: payhere_currency,
+        });
+        if (callbackDecision.idempotent) return { payment: lockedPayment, newlyCompleted: false };
+
+        if (callbackDecision.status === 'completed' && !lockedPayment.metadata?.balancePayment && lockedPayment.order_id) {
+          const order = await db.Order.findByPk(lockedPayment.order_id, {
+            include: [{ model: db.ProductOption, as: 'productOption' }],
+            transaction,
+            lock: transaction.LOCK.UPDATE,
+          });
+          if (!order || order.status === 'cancelled') {
+            throw Object.assign(new Error('This order can no longer accept payment'), {
+              statusCode: 409,
+              code: 'ORDER_NOT_PAYABLE',
+            });
+          }
+          const capacityRequest = {
+            urgent: Boolean(order.is_urgent || order.productOption?.is_urgent),
+            scheduled: Boolean(order.is_scheduled || order.productOption?.is_scheduled),
+            scheduledDate: order.productOption?.scheduled_date,
+            people: order.productOption?.num_subjects,
+            frameId: order.productOption?.frame_type,
+            deliveryMethod: order.productOption?.pickup_option,
+          };
+          await assertUrgentAvailability(capacityRequest, transaction, order.order_id);
+          await assertScheduledAvailability(capacityRequest, transaction, order.order_id);
+        }
+
+        await lockedPayment.update({
+          status: callbackDecision.status,
+          completedAt: callbackDecision.status === 'completed' ? new Date() : null,
+          transactionId: payment_id || null,
+          payherePaymentId: payment_id || null,
+          metadata: {
+            ...(lockedPayment.metadata || {}),
+            payhereAmount: payhere_amount,
+            payhereCurrency: payhere_currency,
+            payhereMethod: method,
+            payhereStatusCode: status_code,
+            payhereStatusMessage: status_message || null
+          }
+        }, { transaction });
+        await syncLinkedOrderPayment(lockedPayment, transaction);
+        return {
+          payment: lockedPayment,
+          newlyCompleted: callbackDecision.status === 'completed',
+        };
+      }));
     } catch (error) {
-      return res.status(error.statusCode || 400).send(error.message);
+      if (error.statusCode) return res.status(error.statusCode).send(error.message);
+      throw error;
     }
-    if (callbackDecision.idempotent) return res.send('OK');
 
-    await payment.update({
-      status: callbackDecision.status,
-      completedAt: callbackDecision.status === 'completed' ? new Date() : null,
-      transactionId: payment_id || null,
-      payherePaymentId: payment_id || null,
-      metadata: {
-        ...(payment.metadata || {}),
-        payhereAmount: payhere_amount,
-        payhereCurrency: payhere_currency,
-        payhereMethod: method,
-        payhereStatusCode: status_code,
-        payhereStatusMessage: status_message || null
-      }
-    });
+    if (!payment) return res.status(404).send('Payment record not found');
 
-    await syncLinkedOrderPayment(payment);
-
-    if (payment.status === 'completed') {
+    if (newlyCompleted) {
       await completeInitialOrderPayment(payment);
       ensureInvoiceGenerated(payment).catch((err) => {
         console.error('Invoice generation failed:', err);
@@ -834,81 +877,7 @@ router.post('/sandbox-confirm-return/:orderId', requireCustomer, requireOwnedPay
   }
 });
 
-// 4. Process bank transfer payments
-router.post('/process', requireCustomer, async (req, res) => {
-  try {
-    const { orderId, paymentMethod, bankDetails } = req.body;
-
-    // Find the payment record
-    const payment = await Payment.findOne({ where: { payhereOrderId: orderId } });
-    if (!payment) {
-      return res.status(404).json({
-        success: false,
-        error: 'Order not found'
-      });
-    }
-
-    const ownedOrder = payment.order_id && await db.Order.findOne({
-      where: { order_id: payment.order_id, customer_id: req.customerId },
-      attributes: ['order_id'],
-    });
-    if (!ownedOrder) return res.status(404).json({ success: false, error: 'Order not found' });
-
-    let result;
-
-    if (paymentMethod === 'bank') {
-      // Bank transfer - generate reference
-      result = {
-        success: true,
-        transactionId: `BT-${Date.now()}`,
-        reference: `REF-${Date.now().toString().slice(-6)}`,
-        bankDetails: bankDetails,
-        message: 'Bank transfer initiated'
-      };
-    } else {
-      return res.status(400).json({
-        success: false,
-        error: 'Use /create-payhere-checkout for card payments'
-      });
-    }
-
-    const wasPending = payment.status === 'pending';
-    // Update payment record
-    await payment.update({
-      status: 'completed',
-      completedAt: new Date(),
-      transactionId: result.transactionId,
-      bankReference: result.reference || null,
-      metadata: result
-    });
-
-    await syncLinkedOrderPayment(payment);
-    if (wasPending) await completeInitialOrderPayment(payment);
-
-    ensureInvoiceGenerated(payment).catch((err) => {
-      console.error('Invoice generation failed:', err);
-    });
-
-    res.json({
-      success: true,
-      payment: {
-        id: payment.paymentId,
-        orderId: payment.payhereOrderId,
-        status: payment.status,
-        transactionId: payment.transactionId,
-        ...result
-      }
-    });
-  } catch (error) {
-    console.error('Payment processing error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Payment processing failed'
-    });
-  }
-});
-
-// 5. Get Prices (must be before /:orderId to avoid route conflicts)
+// 4. Get Prices (must be before /:orderId to avoid route conflicts)
 router.get('/prices', async (req, res) => {
   try {
     const catalog = await getCatalog();
@@ -919,7 +888,7 @@ router.get('/prices', async (req, res) => {
   }
 });
 
-// 6. Get Payment Status
+// 5. Get Payment Status
 router.get('/status/:orderId', requireCustomer, requireOwnedPayment, async (req, res) => {
   try {
     const payment = req.payment;
@@ -945,7 +914,7 @@ router.get('/status/:orderId', requireCustomer, requireOwnedPayment, async (req,
   }
 });
 
-// 7. Download invoice PDF (available once payment is completed)
+// 6. Download invoice PDF (available once payment is completed)
 router.get('/:orderId/invoice', requirePaymentViewer, requireOwnedPayment, async (req, res) => {
   try {
     const payment = req.payment;
@@ -968,7 +937,7 @@ router.get('/:orderId/invoice', requirePaymentViewer, requireOwnedPayment, async
   }
 });
 
-// 8. Get All Payments (for admin)
+// 7. Get All Payments (for admin)
 router.get('/', requireAdmin, async (req, res) => {
   try {
     const { page, limit, offset } = paginationFrom(req.query);

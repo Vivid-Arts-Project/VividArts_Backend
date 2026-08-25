@@ -12,6 +12,8 @@ const { realtimeNotificationHub } = require('../utils/notificationRealtime');
 const { calculateCompletionFromSketchingStart, sortProductionQueue } = require('../utils/scheduling');
 const { paginationFrom, paginationMeta } = require('../utils/pagination');
 const { ORDER_STATUSES, normalizeStatus, allowedTransitions, canTransition } = require('../utils/orderWorkflow');
+const { normalizeMessage } = require('../utils/messageRules');
+const { requireAdmin } = require('./adminAuth');
 
 const ensureUrgentDeadlineNotifications = async () => {
   const tomorrow = new Date();
@@ -19,7 +21,7 @@ const ensureUrgentDeadlineNotifications = async () => {
   const deadline = `${tomorrow.getFullYear()}-${String(tomorrow.getMonth() + 1).padStart(2, '0')}-${String(tomorrow.getDate()).padStart(2, '0')}`;
   const urgentOrders = await db.Order.findAll({
     where: {
-      status: { [db.Sequelize.Op.notIn]: ['done'] },
+      status: { [db.Sequelize.Op.notIn]: ['done', 'cancelled'] },
       amount_paid: { [db.Sequelize.Op.gt]: 0 },
     },
     include: [{
@@ -105,10 +107,6 @@ const customerJson = (instance) => {
 };
 
 // ─── Auth middleware ─────────────────────────────────────────────────────────
-const requireAdmin = (req, res, next) => {
-  if (!req.session?.adminId) return res.status(401).json({ error: 'Unauthorized' });
-  next();
-};
 const requireSuperAdmin = async (req, res, next) => {
   try {
     const admin = await db.Admin.findByPk(req.session?.adminId, { attributes: ['id', 'isSuperAdmin', 'isActive'] });
@@ -419,7 +417,7 @@ router.get('/calendar-events', requireAdmin, async (req, res) => {
     const from = /^\d{4}-\d{2}-\d{2}$/.test(req.query.from || '') ? req.query.from : null;
     const to = /^\d{4}-\d{2}-\d{2}$/.test(req.query.to || '') ? req.query.to : null;
     const rows = await db.Order.findAll({
-      where: { status: { [db.Sequelize.Op.ne]: 'done' }, amount_paid: { [db.Sequelize.Op.gt]: 0 } },
+      where: { status: { [db.Sequelize.Op.notIn]: ['done', 'cancelled'] }, amount_paid: { [db.Sequelize.Op.gt]: 0 } },
       attributes: ['order_id', 'status', 'is_urgent', 'is_scheduled'],
       include: [
         { model: db.Customer, as: 'customer', attributes: ['full_name', 'username'] },
@@ -451,11 +449,11 @@ router.get('/orders', requireAdmin, async (req, res) => {
       include: [{ model: db.ProductOption, as: 'productOption', attributes: ['urgent_deadline', 'is_scheduled', 'scheduled_date', 'scheduled_start_date', 'num_subjects', 'frame_type', 'pickup_option'] }],
     });
     const stats = {
-      total:       queueRows.filter(o => o.status !== 'done').length,
+      total:       queueRows.filter(o => !['done', 'cancelled'].includes(o.status)).length,
       inQueue:     queueRows.filter(o => o.status === 'in_queue').length,
       sketching:     queueRows.filter(o => o.status === 'sketching').length,
-      urgentActive:   queueRows.filter(o => o.is_urgent && o.status !== 'done').length,
-      scheduledActive: queueRows.filter(o => o.is_scheduled && o.status !== 'done').length,
+      urgentActive:   queueRows.filter(o => o.is_urgent && !['done', 'cancelled'].includes(o.status)).length,
+      scheduledActive: queueRows.filter(o => o.is_scheduled && !['done', 'cancelled'].includes(o.status)).length,
       waitingFeedback: queueRows.filter(o => o.status === 'waiting_for_feedback').length,
       revisionRequested: queueRows.filter(o => o.status === 'revision_requested').length,
       approved:     queueRows.filter(o => ['approved', 'finished'].includes(o.status)).length,
@@ -546,51 +544,53 @@ router.delete('/orders/:id', requireAdmin, async (req, res) => {
     if (!cancellationReason) return res.status(400).json({ error: 'A cancellation reason is required' });
     if (cancellationReason.length > 500) return res.status(400).json({ error: 'Cancellation reason must be 500 characters or fewer' });
 
-    const order = await db.Order.findByPk(req.params.id, {
-      include: [
-        { model: db.ReferencePhoto, as: 'referencePhotos' },
-        { model: db.ProofImage, as: 'proofImages' },
-      ],
+    const order = await db.sequelize.transaction(async transaction => {
+      const lockedOrder = await db.Order.findByPk(req.params.id, {
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+      });
+      if (!lockedOrder) throw Object.assign(new Error('Order not found'), { statusCode: 404 });
+      if (lockedOrder.status === 'cancelled') {
+        throw Object.assign(new Error('This order is already cancelled'), { statusCode: 409 });
+      }
+      await lockedOrder.update({
+        status: 'cancelled',
+        cancelled_at: new Date(),
+        cancellation_reason: cancellationReason,
+        cancelled_by_admin_id: req.session.adminId,
+      }, { transaction });
+      await db.Message.create({
+        order_id: lockedOrder.order_id,
+        sender_type: 'system',
+        message_text: `Order cancelled by the studio. Reason: ${cancellationReason}`,
+      }, { transaction });
+      return lockedOrder;
     });
-    if (!order) return res.status(404).json({ error: 'Order not found' });
 
-    const productId = order.product_id;
-    const publicIds = [
-      ...(order.referencePhotos || []).map(photo => photo.cloudinary_public_id),
-      ...(order.proofImages || []).map(proof => proof.cloudinary_public_id),
-    ].filter(Boolean);
-
-    await db.sequelize.transaction(async transaction => {
-      await db.Message.destroy({ where: { order_id: order.order_id }, transaction });
-      await db.ReferencePhoto.destroy({ where: { order_id: order.order_id }, transaction });
-      await db.ProofImage.destroy({ where: { order_id: order.order_id }, transaction });
-      await db.Payment.destroy({ where: { order_id: order.order_id }, transaction });
-      await order.destroy({ transaction });
-      if (productId) await db.ProductOption.destroy({ where: { product_id: productId }, transaction });
-    });
-
-    await Promise.allSettled(publicIds.map(deleteImage));
     await createNotification(
       order.customer_id,
-      null,
+      order.order_id,
       'Order cancelled',
       `Your portrait order was cancelled by the studio. Reason: ${cancellationReason}`,
       'cancelled',
     );
     await createAdminNotification({
       adminId: req.session.adminId,
+      orderId: order.order_id,
       type: 'order',
       title: 'Order cancelled',
-      message: `Order #${order.order_id.slice(0, 8)} was permanently deleted: ${cancellationReason}`,
+      message: `Order #${order.order_id.slice(0, 8)} was cancelled and retained: ${cancellationReason}`,
     });
 
-    res.json({ message: 'Order cancelled and deleted' });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    res.json({ message: 'Order cancelled. Payment and order history were retained.', order });
+  } catch (err) { res.status(err.statusCode || 500).json({ error: err.message }); }
 });
 
 router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
   try {
-    const { status, customMessage } = req.body;
+    const { status } = req.body;
+    const customMessage = String(req.body.customMessage || '').trim();
+    if (customMessage.length > 255) return res.status(400).json({ error: 'Status message must be 255 characters or fewer' });
     if (!ORDER_STATUSES.includes(normalizeStatus(status))) return res.status(400).json({ error: 'Invalid status' });
 
     const order = await db.Order.findByPk(req.params.id, {
@@ -639,12 +639,6 @@ router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
       await order.update(statusUpdate);
     }
 
-    if (status === 'shipped' && order.pickupOption === 'pickup') {
-      const admin = await db.Admin.findByPk(req.session.adminId);
-      const location = order.artistLocation || admin?.businessAddress || process.env.STUDIO_LOCATION || 'Contact admin for pickup address';
-      await db.Message.create({ order_id: order.order_id, sender_type: 'system', message_text: `Your order is ready for pickup. Location: ${location}` });
-    }
-
     // Notification එක සෑදීම
     let title = 'Order Status Updated';
     let message = customMessage || `Your order status has been updated to ${status}.`;
@@ -660,7 +654,7 @@ router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
       message = customMessage || 'Your portrait drawing is completed and framed perfectly.';
     } else if (status === 'shipped') {
       title = 'Order Dispatched / Ready!';
-      message = customMessage || 'Your portrait package is on its way or ready for pickup!';
+      message = customMessage || 'Your portrait package has been dispatched and is on its way!';
     } else if (status === 'done') {
       title = 'Order Completed!';
       message = customMessage || 'Your portrait order has been delivered and completed!';
@@ -677,24 +671,20 @@ router.post('/orders/:id/proof', requireAdmin, (req, res) => {
     if (err) return res.status(400).json({ error: err.message });
     if (!req.file) return res.status(400).json({ error: 'No image uploaded' });
     try {
-      const order = await db.Order.findByPk(req.params.id, {
-        include: [{ model: db.Customer, as: 'customer' }],
-      });
-      if (!order) return res.status(404).json({ error: 'Order not found' });
-
-      const transaction = await db.sequelize.transaction();
-      try {
-        const version = (await db.ProofImage.count({ where: { order_id: order.order_id }, transaction })) + 1;
-        const duplicateVersion = await db.ProofImage.findOne({
-          where: { order_id: order.order_id, version },
+      const result = await db.sequelize.transaction(async transaction => {
+        const order = await db.Order.findByPk(req.params.id, {
           transaction,
+          lock: transaction.LOCK.UPDATE,
         });
-
-        if (duplicateVersion) {
-          await transaction.rollback();
-          return res.status(409).json({ error: 'This proof version already exists.' });
+        if (!order) throw Object.assign(new Error('Order not found'), { statusCode: 404 });
+        if (Number(order.amount_paid || 0) <= 0) {
+          throw Object.assign(new Error('A proof cannot be uploaded before the deposit is paid'), { statusCode: 409 });
+        }
+        if (!['sketching', 'revision_requested'].includes(order.status)) {
+          throw Object.assign(new Error('A proof can only be uploaded while sketching or responding to a revision request'), { statusCode: 409 });
         }
 
+        const version = (await db.ProofImage.max('version', { where: { order_id: order.order_id }, transaction }) || 0) + 1;
         await db.ProofImage.update({ is_current: false }, {
           where: { order_id: order.order_id },
           transaction,
@@ -729,38 +719,41 @@ router.post('/orders/:id/proof', requireAdmin, (req, res) => {
           'waiting_for_feedback',
           { transaction }
         );
+        const customer = await db.Customer.findByPk(order.customer_id, { transaction });
+        return { order, proof, customer, version };
+      });
 
-        await transaction.commit();
-
-        const customerName = order.customer?.full_name || order.customer?.username || 'Customer';
-        await sendProofReadyEmail(order.customer.email, customerName, order.order_id, version);
-
-        res.json({ message: 'Proof uploaded, customer notified', proofUrl: proof.cloudinary_url });
-      } catch (transactionError) {
-        await transaction.rollback();
-        throw transactionError;
-      }
+      const customerName = result.customer?.full_name || result.customer?.username || 'Customer';
+      await sendProofReadyEmail(result.customer?.email, customerName, result.order.order_id, result.version);
+      res.json({ message: 'Proof uploaded, customer notified', proofUrl: result.proof.cloudinary_url });
     } catch (e) {
-      res.status(500).json({ error: e.message });
+      await deleteImage(req.file.filename).catch(() => {});
+      if (e.name === 'SequelizeUniqueConstraintError') {
+        return res.status(409).json({ error: 'A proof was uploaded concurrently. Refresh and try again.' });
+      }
+      res.status(e.statusCode || 500).json({ error: e.statusCode ? e.message : 'Unable to upload proof' });
     }
   });
 });
 
 router.post('/orders/:id/messages', requireAdmin, async (req, res) => {
   try {
-    const { message } = req.body;
-    if (!message?.trim()) return res.status(400).json({ error: 'Message is required' });
-    const msg = await db.Message.create({ order_id: req.params.id, sender_type: 'admin', sender_id: req.session.adminId, message_text: message.trim() });
+    const message = normalizeMessage(req.body.message);
+    const order = await db.Order.findByPk(req.params.id, { attributes: ['order_id', 'status'] });
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.status === 'cancelled') return res.status(409).json({ error: 'Messaging is closed for cancelled orders' });
+    const msg = await db.Message.create({ order_id: order.order_id, sender_type: 'admin', sender_id: req.session.adminId, message_text: message });
     res.status(201).json(msg);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(err.statusCode || 500).json({ error: err.message, code: err.code }); }
 });
 
 router.patch('/orders/:id/location', requireAdmin, async (req, res) => {
   try {
-    const { artistLocation } = req.body;
+    const artistLocation = String(req.body.artistLocation || '').trim();
+    if (artistLocation.length > 500) return res.status(400).json({ error: 'Location must be 500 characters or fewer' });
     const order = await db.Order.findByPk(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
-    await order.update({ artist_location: artistLocation });
+    await order.update({ artist_location: artistLocation || null });
     res.json({ message: 'Location saved' });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });

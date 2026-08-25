@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const PDFDocument = require('pdfkit');
 const { calculateOrder } = require('./pricing');
 
@@ -19,6 +20,7 @@ const money = (amount, currency) => {
 };
 
 const invoicePath = (orderId) => path.join(INVOICES_DIR, `invoice-${orderId}.pdf`);
+const invoiceGenerationPromises = new Map();
 
 function drawRow(doc, y, label, value, { bold = false } = {}) {
   doc.font(bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(10);
@@ -140,7 +142,7 @@ async function renderInvoice(doc, payment) {
   doc.font('Helvetica-Bold').fontSize(11).fillColor('#1a1a2e').text('Payment', 350, infoY, { width: 195 });
   infoY += 16;
   doc.font('Helvetica').fontSize(10).fillColor('#374151');
-  doc.text(`Method: ${payment.paymentMethod === 'card' ? 'Bank card (PayHere)' : (payment.paymentMethod || 'PayHere')}`, 350, infoY, { width: 195 }); infoY += 14;
+  doc.text('Method: Online card payment (PayHere)', 350, infoY, { width: 195 }); infoY += 14;
   doc.text(`Status: ${payment.status}`, 350, infoY, { width: 195 }); infoY += 14;
   if (isBalancePayment) {
     doc.text('Payment Type: Balance payment (Final)', 350, infoY, { width: 195 }); infoY += 14;
@@ -228,18 +230,36 @@ async function generateInvoiceBuffer(payment) {
 }
 
 async function ensureInvoiceGenerated(payment) {
-  fs.mkdirSync(INVOICES_DIR, { recursive: true });
   const filePath = invoicePath(payment.payhereOrderId);
-  const logoUpdatedAt = fs.existsSync(LOGO_PATH) ? fs.statSync(LOGO_PATH).mtimeMs : 0;
-  const templateUpdatedAt = fs.statSync(__filename).mtimeMs;
-  const invoiceUpdatedAt = fs.existsSync(filePath) ? fs.statSync(filePath).mtimeMs : 0;
+  if (invoiceGenerationPromises.has(filePath)) return invoiceGenerationPromises.get(filePath);
 
-  if (!fs.existsSync(filePath) || invoiceUpdatedAt < Math.max(logoUpdatedAt, templateUpdatedAt)) {
-    const buffer = await generateInvoiceBuffer(payment);
-    fs.writeFileSync(filePath, buffer);
-  }
-
-  return filePath;
+  const generation = (async () => {
+    await fs.promises.mkdir(INVOICES_DIR, { recursive: true });
+    const modifiedAt = async target => fs.promises.stat(target).then(stat => stat.mtimeMs).catch(error => {
+      if (error.code === 'ENOENT') return 0;
+      throw error;
+    });
+    const [logoUpdatedAt, templateUpdatedAt, invoiceUpdatedAt] = await Promise.all([
+      modifiedAt(LOGO_PATH),
+      modifiedAt(__filename),
+      modifiedAt(filePath),
+    ]);
+    if (!invoiceUpdatedAt || invoiceUpdatedAt < Math.max(logoUpdatedAt, templateUpdatedAt)) {
+      const buffer = await generateInvoiceBuffer(payment);
+      const temporaryPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+      try {
+        await fs.promises.writeFile(temporaryPath, buffer, { flag: 'wx' });
+        await fs.promises.rename(temporaryPath, filePath);
+      } finally {
+        await fs.promises.unlink(temporaryPath).catch(error => {
+          if (error.code !== 'ENOENT') throw error;
+        });
+      }
+    }
+    return filePath;
+  })().finally(() => invoiceGenerationPromises.delete(filePath));
+  invoiceGenerationPromises.set(filePath, generation);
+  return generation;
 }
 
 module.exports = {

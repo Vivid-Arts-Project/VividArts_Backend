@@ -13,12 +13,25 @@ cloudinary.config({
 
 // ─── Image filter (runs before upload, rejects non-images) ──────────────────
 const imageFilter = (req, file, cb) => {
-  const allowed = /jpeg|jpg|png|webp/;
-  const isAllowed =
-    allowed.test(file.mimetype) &&
-    allowed.test(file.originalname.toLowerCase());
+  const allowedMimeTypes = new Set(['image/jpeg', 'image/png', 'image/webp']);
+  const isAllowed = allowedMimeTypes.has(String(file.mimetype || '').toLowerCase())
+    && /\.(?:jpe?g|png|webp)$/i.test(String(file.originalname || ''));
   if (isAllowed) return cb(null, true);
   cb(new Error('Only image files are allowed (jpg, png, webp)'));
+};
+
+const detectImageType = (buffer) => {
+  if (!Buffer.isBuffer(buffer)) return null;
+  if (buffer.length >= 3 && buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) {
+    return { mimeType: 'image/jpeg', extension: '.jpg' };
+  }
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))) {
+    return { mimeType: 'image/png', extension: '.png' };
+  }
+  if (buffer.length >= 12 && buffer.toString('ascii', 0, 4) === 'RIFF' && buffer.toString('ascii', 8, 12) === 'WEBP') {
+    return { mimeType: 'image/webp', extension: '.webp' };
+  }
+  return null;
 };
 
 class CloudinaryStorage {
@@ -178,6 +191,12 @@ const deleteImage = async (publicId) => {
 };
 
 const uploadProfileImage = async (file, customerId) => {
+  const detectedType = detectImageType(file?.buffer);
+  if (!detectedType) {
+    const error = new Error('The uploaded file is not a valid JPG, PNG, or WebP image.');
+    error.statusCode = 400;
+    throw error;
+  }
   const uploadOptions = {
     folder: 'art-studio/profiles',
     public_id: `profile_${customerId}_${Date.now()}`,
@@ -195,10 +214,9 @@ const uploadProfileImage = async (file, customerId) => {
     });
     return { url: result.secure_url, publicId: result.public_id };
   } catch (cloudinaryError) {
-    // A local fallback keeps profile updates working if Cloudinary credentials
-    // or connectivity are temporarily unavailable during development.
-    const extension = path.extname(file.originalname).toLowerCase() || '.jpg';
-    const filename = `profile_${customerId}_${Date.now()}_${crypto.randomUUID()}${extension}`;
+    if (process.env.NODE_ENV === 'production') throw cloudinaryError;
+    // Development fallback uses the detected image type, never a user-supplied extension.
+    const filename = `profile_${customerId}_${Date.now()}_${crypto.randomUUID()}${detectedType.extension}`;
     const profilesDirectory = path.resolve(__dirname, '..', 'uploads', 'profiles');
     await fs.promises.mkdir(profilesDirectory, { recursive: true });
     await fs.promises.writeFile(path.join(profilesDirectory, filename), file.buffer);
@@ -207,4 +225,4 @@ const uploadProfileImage = async (file, customerId) => {
   }
 };
 
-module.exports = { uploadProof, uploadReferences, uploadProfile, uploadProfileImage, uploadCover, uploadGallery, uploadReview, deleteImage, cloudinary };
+module.exports = { uploadProof, uploadReferences, uploadProfile, uploadProfileImage, uploadCover, uploadGallery, uploadReview, deleteImage, cloudinary, detectImageType };

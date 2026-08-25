@@ -1,6 +1,7 @@
 const { ORDER_STATUSES } = require('./orderWorkflow');
 
-const ACTIVE_STATUSES = [...ORDER_STATUSES.filter(status => status !== 'done'), 'finished'];
+const TERMINAL_STATUSES = new Set(['done', 'cancelled']);
+const ACTIVE_STATUSES = [...ORDER_STATUSES.filter(status => !TERMINAL_STATUSES.has(status)), 'finished'];
 const DAY_MS = 24 * 60 * 60 * 1000;
 const REVISION_DAYS = 2;
 const DELIVERY_DAYS = 3;
@@ -69,9 +70,9 @@ const insertScheduledOrder = (queue, scheduledOrder, anchor) => {
 };
 
 const sortProductionQueue = (orders) => {
-  const completed = orders.filter(order => order.status === 'done')
+  const completed = orders.filter(order => TERMINAL_STATUSES.has(order.status))
     .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-  const active = orders.filter(order => order.status !== 'done')
+  const active = orders.filter(order => !TERMINAL_STATUSES.has(order.status))
     .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
   const urgent = active.filter(order => order.is_urgent).sort(urgentSort);
   const standard = active.filter(order => !order.is_urgent && !isScheduled(order));

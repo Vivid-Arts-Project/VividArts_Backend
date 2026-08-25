@@ -13,6 +13,15 @@ function remainingBalance(total, payments) {
   return Math.max(0, Number(total || 0) - paid);
 }
 
+function hasUsableCheckout(payment) {
+  return Boolean(
+    payment?.payhereOrderId
+    && payment?.payhereMd5sig
+    && payment?.metadata?.checkoutAmount
+    && payment?.metadata?.checkoutCurrency
+  );
+}
+
 function balanceCheckoutDecision({ orderStatus, total, payments }) {
   if (!['approved', 'finished'].includes(orderStatus)) {
     throw new PaymentRuleError('The balance is available after proof approval', 400, 'PROOF_NOT_APPROVED');
@@ -64,4 +73,4 @@ function paymentSummary(payments) {
   };
 }
 
-module.exports = { PaymentRuleError, remainingBalance, balanceCheckoutDecision, paymentCallbackDecision, paymentSummary };
+module.exports = { PaymentRuleError, remainingBalance, hasUsableCheckout, balanceCheckoutDecision, paymentCallbackDecision, paymentSummary };

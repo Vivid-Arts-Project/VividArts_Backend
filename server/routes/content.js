@@ -2,10 +2,7 @@ const express = require('express');
 const router = express.Router();
 const db = require('../models');
 const { uploadGallery, deleteImage } = require('../middleware/upload');
-
-const requireAdmin = (req, res, next) => req.session?.adminId
-  ? next()
-  : res.status(401).json({ error: 'Unauthorized' });
+const { requireAdmin } = require('./adminAuth');
 
 router.get('/site-settings', async (_req, res) => {
   try {
@@ -103,7 +100,13 @@ router.patch('/admin/gallery/:id', requireAdmin, (req, res) => uploadGallery(req
     if (!image) { if (req.file) await deleteImage(req.file.filename).catch(() => {}); return res.status(404).json({ error: 'Image not found' }); }
     const oldPublicId = image.publicId;
     const updates = {};
-    for (const key of ['title', 'subtitle', 'altText']) if (req.body[key] !== undefined) updates[key] = req.body[key];
+    for (const key of ['title', 'subtitle', 'altText']) {
+      if (req.body[key] !== undefined) {
+        const value = String(req.body[key]).trim();
+        if (value.length > 255) throw Object.assign(new Error(`${key} must be 255 characters or fewer`), { statusCode: 400 });
+        updates[key] = value || null;
+      }
+    }
     if (req.body.placement !== undefined) updates.placement = ['home', 'gallery', 'both'].includes(req.body.placement) ? req.body.placement : 'gallery';
     if (req.body.sortOrder !== undefined) updates.sortOrder = Number(req.body.sortOrder) || 0;
     if (req.body.isActive !== undefined) updates.isActive = String(req.body.isActive) === 'true';
@@ -111,15 +114,31 @@ router.patch('/admin/gallery/:id', requireAdmin, (req, res) => uploadGallery(req
     await image.update(updates);
     if (req.file && oldPublicId) await deleteImage(oldPublicId).catch(() => {});
     res.json(image);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    if (req.file) await deleteImage(req.file.filename).catch(() => {});
+    res.status(e.statusCode || 500).json({ error: e.statusCode ? e.message : 'Unable to update gallery image' });
+  }
 }));
 
 router.patch('/admin/gallery-order', requireAdmin, async (req, res) => {
   const orderedIds = Array.isArray(req.body.orderedIds) ? req.body.orderedIds.map(Number).filter(Number.isInteger) : [];
   if (!orderedIds.length) return res.status(400).json({ error: 'orderedIds is required' });
+  if (new Set(orderedIds).size !== orderedIds.length) return res.status(400).json({ error: 'orderedIds cannot contain duplicates' });
   const transaction = await db.sequelize.transaction();
   try {
-    await Promise.all(orderedIds.map((id, sortOrder) => db.GalleryImage.update({ sortOrder }, { where: { id }, transaction })));
+    const existing = await db.GalleryImage.findAll({
+      attributes: ['id'],
+      transaction,
+      lock: transaction.LOCK.UPDATE,
+    });
+    const existingIds = new Set(existing.map(image => Number(image.id)));
+    if (orderedIds.length !== existingIds.size || orderedIds.some(id => !existingIds.has(id))) {
+      await transaction.rollback();
+      return res.status(400).json({ error: 'orderedIds must contain every gallery image exactly once' });
+    }
+    for (let sortOrder = 0; sortOrder < orderedIds.length; sortOrder += 1) {
+      await db.GalleryImage.update({ sortOrder }, { where: { id: orderedIds[sortOrder] }, transaction });
+    }
     await transaction.commit();
     res.json({ message: 'Image positions updated' });
   } catch (error) {

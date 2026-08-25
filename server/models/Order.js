@@ -61,7 +61,8 @@ module.exports = (sequelize, DataTypes) => {
         'finished',             // artwork is complete
         'framed',               // framing done (if frame was chosen)
         'shipped',              // sent via courier OR ready for pickup
-        'done'                  // customer received, order complete
+        'done',                 // customer received, order complete
+        'cancelled'             // retained for payment and audit history
       ),
       defaultValue: 'in_queue',
     },
@@ -93,6 +94,18 @@ module.exports = (sequelize, DataTypes) => {
     },
     completed_at: {
       type: DataTypes.DATE,
+      allowNull: true,
+    },
+    cancelled_at: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+    cancellation_reason: {
+      type: DataTypes.STRING(500),
+      allowNull: true,
+    },
+    cancelled_by_admin_id: {
+      type: DataTypes.UUID,
       allowNull: true,
     },
     sketching_started_at: {
