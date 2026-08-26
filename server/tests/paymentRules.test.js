@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { remainingBalance, hasUsableCheckout, balanceCheckoutDecision, paymentCallbackDecision, paymentSummary } = require('../utils/paymentRules');
+const { remainingBalance, hasUsableCheckout, balanceCheckoutDecision, paymentCallbackDecision, orderStatusAfterPayment, paymentSummary } = require('../utils/paymentRules');
 const { resolveNotificationCustomerId, runAfterCommit } = require('../utils/notificationHelper');
 const { createRealtimeNotificationHub, emitRealtimeNotification } = require('../utils/notificationRealtime');
 const { enqueueEmailDelivery, claimEmailDeliveries, processEmailQueue, getEligibleAdminRecipients, sendRevisionRequestedAdminEmail } = require('../middleware/email');
@@ -13,6 +13,13 @@ const { hasLiveCapacityReservation, isReusableDepositCheckout } = require('../ut
 
 const deposit = (status = 'completed', amount = 2000) => ({ paymentType: 'advance', status, amount });
 const balance = (status = 'pending', amount = 2000) => ({ paymentType: 'full', status, amount });
+
+test('full payment advances only an approved order to payment finished', () => {
+  assert.equal(orderStatusAfterPayment('approved', true), 'payment_finished');
+  assert.equal(orderStatusAfterPayment('finished', true), 'payment_finished');
+  assert.equal(orderStatusAfterPayment('approved', false), 'approved');
+  assert.equal(orderStatusAfterPayment('sketching', true), 'sketching');
+});
 
 test('paid orders and recent pending deposits reserve production capacity', () => {
   const now = Date.parse('2026-08-25T12:00:00Z');

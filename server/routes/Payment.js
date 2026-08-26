@@ -10,7 +10,7 @@ const { protect } = require('../middleware/authMiddleware');
 const { uploadReferences, deleteImage } = require('../middleware/upload');
 const { createAdminNotification } = require('../utils/adminNotificationHelper');
 const { ACTIVE_STATUSES, buildTimelinePreview, hasScheduledSlotConflict, requiredScheduledStart } = require('../utils/scheduling');
-const { balanceCheckoutDecision, hasUsableCheckout, paymentCallbackDecision, paymentSummary } = require('../utils/paymentRules');
+const { balanceCheckoutDecision, hasUsableCheckout, paymentCallbackDecision, orderStatusAfterPayment, paymentSummary } = require('../utils/paymentRules');
 const { onlinePaymentMethod } = require('../utils/paymentMethod');
 const { assertPayhereCallbackAuthenticity } = require('../utils/payhereSecurity');
 const { hasLiveCapacityReservation, isReusableDepositCheckout } = require('../utils/capacityReservation');
@@ -301,7 +301,7 @@ const mapPayhereStatus = (statusCode) => {
 const syncLinkedOrderPayment = async (payment, transaction) => {
   if (!payment.order_id) return;
   const order = await db.Order.findByPk(payment.order_id, {
-    attributes: ['calculated_price'],
+    attributes: ['calculated_price', 'status'],
     transaction,
     lock: transaction ? transaction.LOCK.UPDATE : undefined,
   });
@@ -312,7 +312,11 @@ const syncLinkedOrderPayment = async (payment, transaction) => {
   });
   const paidInFull = order && Number(completed || 0) >= Number(order.calculated_price || 0);
   await db.Order.update(
-    { amount_paid: Number(completed || 0), payment_type: paidInFull ? 'full' : 'advance' },
+    {
+      amount_paid: Number(completed || 0),
+      payment_type: paidInFull ? 'full' : 'advance',
+      status: orderStatusAfterPayment(order.status, paidInFull),
+    },
     { where: { order_id: payment.order_id }, transaction },
   );
 };

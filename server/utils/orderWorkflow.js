@@ -1,6 +1,10 @@
 const ORDER_STATUSES = Object.freeze([
   'in_queue', 'sketching', 'waiting_for_feedback', 'revision_requested',
-  'approved', 'framed', 'shipped', 'done', 'cancelled',
+  'approved', 'payment_finished', 'framed', 'shipped', 'done', 'cancelled',
+]);
+
+const SYSTEM_CONTROLLED_STATUSES = Object.freeze([
+  'waiting_for_feedback', 'revision_requested', 'approved', 'payment_finished',
 ]);
 
 function normalizeStatus(status) {
@@ -14,9 +18,10 @@ function allowedTransitions(status, product = {}) {
   const transitions = {
     in_queue: ['in_queue', 'sketching'],
     sketching: ['sketching', 'waiting_for_feedback'],
-    waiting_for_feedback: ['waiting_for_feedback', 'sketching', 'revision_requested', 'approved'],
-    revision_requested: ['revision_requested', 'sketching', 'waiting_for_feedback'],
-    approved: ['approved', ...(hasFrame ? ['framed'] : usesCourier ? ['shipped'] : ['done'])],
+    waiting_for_feedback: ['waiting_for_feedback', 'revision_requested', 'approved'],
+    revision_requested: ['revision_requested', 'waiting_for_feedback'],
+    approved: ['approved', 'payment_finished'],
+    payment_finished: ['payment_finished', ...(hasFrame ? ['framed'] : usesCourier ? ['shipped'] : ['done'])],
     framed: ['framed', ...(usesCourier ? ['shipped'] : ['done'])],
     shipped: ['done'],
     done: ['done'],
@@ -29,4 +34,19 @@ function canTransition(current, requested, product) {
   return allowedTransitions(current, product).includes(normalizeStatus(requested));
 }
 
-module.exports = { ORDER_STATUSES, normalizeStatus, allowedTransitions, canTransition };
+function adminAllowedTransitions(status, product = {}) {
+  const current = normalizeStatus(status);
+  if (['waiting_for_feedback', 'revision_requested', 'approved'].includes(current)) return [current];
+  return allowedTransitions(current, product).filter(candidate => (
+    candidate === current || !SYSTEM_CONTROLLED_STATUSES.includes(candidate)
+  ));
+}
+
+module.exports = {
+  ORDER_STATUSES,
+  SYSTEM_CONTROLLED_STATUSES,
+  normalizeStatus,
+  allowedTransitions,
+  canTransition,
+  adminAllowedTransitions,
+};

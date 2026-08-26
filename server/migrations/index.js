@@ -15,6 +15,7 @@ const orderWorkflowIntegrity = require('./012-order-workflow-integrity');
 const capacityReservationLock = require('./013-capacity-reservation-lock');
 const emailQueueClaims = require('./014-email-queue-claims');
 const verificationTokenIntegrity = require('./015-verification-token-integrity');
+const paymentFinishedOrderStatus = require('./016-payment-finished-order-status');
 
 const migrations = [
   baseline,
@@ -33,6 +34,7 @@ const migrations = [
   capacityReservationLock,
   emailQueueClaims,
   verificationTokenIntegrity,
+  paymentFinishedOrderStatus,
 ];
 
 async function runMigrations(db) {

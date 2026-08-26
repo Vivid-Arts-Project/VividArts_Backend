@@ -55,6 +55,10 @@ function paymentCallbackDecision({ currentStatus, nextStatus, expectedAmount, re
   return { idempotent: false, status: nextStatus };
 }
 
+function orderStatusAfterPayment(orderStatus, paidInFull) {
+  return paidInFull && ['approved', 'finished'].includes(orderStatus) ? 'payment_finished' : orderStatus;
+}
+
 function paymentSummary(payments) {
   const orders = new Map();
 
@@ -73,4 +77,4 @@ function paymentSummary(payments) {
   };
 }
 
-module.exports = { PaymentRuleError, remainingBalance, hasUsableCheckout, balanceCheckoutDecision, paymentCallbackDecision, paymentSummary };
+module.exports = { PaymentRuleError, remainingBalance, hasUsableCheckout, balanceCheckoutDecision, paymentCallbackDecision, orderStatusAfterPayment, paymentSummary };

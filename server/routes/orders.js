@@ -343,6 +343,7 @@ router.post('/:id/proof-review', protect, async (req, res) => {
         note: req.body.note,
       });
       const reviewedAt = new Date();
+      const isFullyPaid = Number(order.amount_paid || 0) >= Number(order.calculated_price || 0);
 
       await proof.update({
         review_status: decision.approved ? 'approved' : 'revision_requested',
@@ -350,7 +351,7 @@ router.post('/:id/proof-review', protect, async (req, res) => {
         reviewed_at: reviewedAt,
       }, { transaction });
       await order.update({
-        status: decision.approved ? 'approved' : 'revision_requested',
+        status: decision.approved ? (isFullyPaid ? 'payment_finished' : 'approved') : 'revision_requested',
         ...(decision.approved ? { approved_at: reviewedAt } : {}),
       }, { transaction });
       await db.Message.create({
