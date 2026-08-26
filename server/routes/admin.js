@@ -11,7 +11,7 @@ const { createAdminNotification } = require('../utils/adminNotificationHelper');
 const { realtimeNotificationHub } = require('../utils/notificationRealtime');
 const { calculateCompletionFromSketchingStart, sortProductionQueue } = require('../utils/scheduling');
 const { paginationFrom, paginationMeta } = require('../utils/pagination');
-const { ORDER_STATUSES, normalizeStatus, allowedTransitions, canTransition } = require('../utils/orderWorkflow');
+const { ORDER_STATUSES, SYSTEM_CONTROLLED_STATUSES, normalizeStatus, adminAllowedTransitions, canTransition } = require('../utils/orderWorkflow');
 const { normalizeMessage } = require('../utils/messageRules');
 const { requireAdmin } = require('./adminAuth');
 
@@ -72,7 +72,7 @@ const orderJson = (instance) => {
     messages: [...(o.messages || [])]
       .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
       .map(m => ({ ...m, senderType: m.sender_type, message: m.message_text })),
-    allowedTransitions: allowedTransitions(o.status, p),
+    allowedTransitions: adminAllowedTransitions(o.status, p),
   };
 };
 
@@ -457,6 +457,7 @@ router.get('/orders', requireAdmin, async (req, res) => {
       waitingFeedback: queueRows.filter(o => o.status === 'waiting_for_feedback').length,
       revisionRequested: queueRows.filter(o => o.status === 'revision_requested').length,
       approved:     queueRows.filter(o => ['approved', 'finished'].includes(o.status)).length,
+      paymentFinished: queueRows.filter(o => o.status === 'payment_finished').length,
       totalValue:    queueRows.reduce((sum, o) => sum + Number(o.calculated_price || 0), 0),
       totalCollected:  queueRows.reduce((sum, o) => sum + Number(o.amount_paid || 0), 0),
     };
@@ -593,13 +594,17 @@ router.patch('/orders/:id/status', requireAdmin, async (req, res) => {
     if (customMessage.length > 255) return res.status(400).json({ error: 'Status message must be 255 characters or fewer' });
     if (!ORDER_STATUSES.includes(normalizeStatus(status))) return res.status(400).json({ error: 'Invalid status' });
 
+    const requested = normalizeStatus(status);
+    if (SYSTEM_CONTROLLED_STATUSES.includes(requested)) {
+      return res.status(400).json({ error: 'This status is controlled automatically by proof upload or customer review' });
+    }
+
     const order = await db.Order.findByPk(req.params.id, {
       include: [{ model: db.Customer, as: 'customer' }],
     });
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
     const product = await order.getProductOption();
-    const requested = normalizeStatus(status);
     if (!canTransition(order.status, requested, product)) {
       return res.status(400).json({ error: 'This status change is not available at the current workflow stage' });
     }

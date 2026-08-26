@@ -59,6 +59,7 @@ module.exports = (sequelize, DataTypes) => {
         'revision_requested',   // customer asked for changes
         'approved',             // customer approved the proof
         'finished',             // artwork is complete
+        'payment_finished',     // customer completed the full payment
         'framed',               // framing done (if frame was chosen)
         'shipped',              // sent via courier OR ready for pickup
         'done',                 // customer received, order complete
